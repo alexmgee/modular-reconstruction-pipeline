@@ -300,130 +300,259 @@ python -m modular_pipeline.sfm \
 
 ## 4. Installation
 
-### Core Dependencies
+### Before You Start
 
+**What you need:**
+- A computer with Python 3.10 installed
+- A terminal/command prompt (explained below)
+- Internet connection
+
+**Opening your terminal:**
+- **Windows:** Press `Win + R`, type `cmd`, press Enter
+- **Mac:** Press `Cmd + Space`, type `terminal`, press Enter  
+- **Linux:** Press `Ctrl + Alt + T`
+
+---
+
+### Step 1: Create a Python Environment
+
+**What this does:** Creates an isolated Python workspace so MRP doesn't interfere with other programs.
+
+**Copy and paste this into your terminal:**
 ```bash
-# Python environment
 conda create -n mrp python=3.10
-conda activate mrp
-
-# Core packages
-pip install numpy opencv-python torch torchvision h5py pyyaml tqdm pillow piexif
-
-# Feature extraction/matching
-pip install lightglue
-
-# SfM
-git clone --recursive https://github.com/cvg/Hierarchical-Localization/
-cd Hierarchical-Localization && pip install -e .
 ```
 
-### Optional Dependencies
+Press Enter. Type `y` when asked to proceed.
+
+**Activate it:**
+```bash
+conda activate mrp
+```
+
+You should see `(mrp)` appear at the start of your terminal line. This means you're "inside" the environment.
+
+---
+
+### Step 2: Install Core Packages
+
+**What this does:** Downloads the essential Python libraries MRP needs to run.
 
 ```bash
-# Video extraction
-sudo apt install ffmpeg
-
-# Masking (SAM3)
-git clone https://github.com/facebookresearch/sam3
-cd sam3 && pip install -e .
-wget https://dl.fbaipublicfiles.com/sam3/sam3_hiera_large.pt -P checkpoints/
-
-# 360° reframing
-# (Uses existing reframe_v2.py - no additional install)
+pip install numpy opencv-python torch torchvision h5py pyyaml tqdm pillow piexif lightglue
 ```
+
+This will take 2-5 minutes. You'll see progress bars.
+
+---
+
+### Step 3: Install SfM Tools
+
+**What this does:** Installs GLOMAP/COLMAP for building 3D reconstructions.
+
+```bash
+git clone --recursive https://github.com/cvg/Hierarchical-Localization/
+cd Hierarchical-Localization
+pip install -e .
+cd ..
+```
+
+**What each line means:**
+- Line 1: Downloads the HLOC code from GitHub
+- Line 2: Moves into that folder (think: opening a subfolder)
+- Line 3: Installs it  
+- Line 4: Moves back to your original folder
+
+---
+
+### Step 4 (Optional): Video Support
+
+**Only needed if you're starting from video files** (skip if you have images).
+
+**Linux/Mac:**
+```bash
+sudo apt install ffmpeg
+```
+
+**Windows:**  
+Download from [ffmpeg.org](https://ffmpeg.org/download.html) and follow their install guide.
+
+---
+
+### Step 5 (Optional): 360° Camera Support
+
+**Only needed for Osmo 360, Insta360, GoPro MAX** (skip for drones/DSLRs).
+
+Nothing to install! MRP uses the built-in `reframe_v2.py` module.
 
 ---
 
 ## 5. Quick Start
 
-### Scenario 1: Mavic 3 Pro / Air 2S (6,900 Images)
+### Absolute Beginner? Start Here
 
-```bash
-# Extract features
-python -m modular_pipeline.extract \
-  ./drone_images \
-  ./output \
-  --extractor aliked \
-  --num-keypoints 8000
+**Goal:** Turn your drone photos into a COLMAP reconstruction in one command.
 
-# Match (NetVLAD retrieval for large datasets)
-python -m modular_pipeline.match \
-  ./output/features.h5 \
-  ./output \
-  --matcher lightglue \
-  --retrieval netvlad
+#### Step 1: Prepare Your Folder
 
-# Reconstruct
-python -m modular_pipeline.sfm \
-  ./output \
-  --backend glomap
+**Create this structure on your computer:**
 
-# Output: ./output/sparse/0/ (load into PostShot)
+```
+my_project/
+└── source/
+    ├── IMG_0001.jpg
+    ├── IMG_0002.jpg
+    └── ... (rest of your images)
 ```
 
-**Why these settings:**
-- ALIKED: SOTA feature detector (ECCV 2024)
-- NetVLAD: Avoids O(n²) matching (6,900² = 47M pairs → 345K pairs)
-- GLOMAP: 10-50x faster than COLMAP
+**How:**
+1. Create a folder named `my_project` (anywhere you want)
+2. Inside it, create a subfolder named `source`
+3. Copy all your drone photos into `source/`
 
 ---
 
-### Scenario 2: Osmo Action 360
+#### Step 2: Open Terminal in the Right Place
 
+**You need to "be" in the parent folder** (the one containing `my_project`).
+
+**How to get there:**
+
+**Windows:**
+1. Open File Explorer
+2. Navigate to the folder containing `my_project`
+3. Hold `Shift`, right-click empty space
+4. Click "Open PowerShell window here"
+
+**Mac/Linux:**
+1. Open your file manager
+2. Navigate to the folder containing `my_project`
+3. Right-click → "Open Terminal here" (or drag folder to Terminal icon)
+
+**Check you're in the right place:**
 ```bash
-# Extract frames
-python -m modular_pipeline.ingest.extract \
-  ./360_video.mp4 \
-  ./output \
-  --fps 2
-
-# Reframe to pinhole (REQUIRED for 360°)
-python -m modular_pipeline.prepare.reframe \
-  ./output/frames \
-  ./output \
-  --pattern ring12
-
-# (Optional) Remove tripod/selfie stick
-python -m modular_pipeline.prepare.masking \
-  ./output/rig_views \
-  ./output \
-  --prompts "tripod,selfie stick"
-
-# Reconstruct
-python -m modular_pipeline.extract ./output/rig_views ./output
-python -m modular_pipeline.match ./output/features.h5 ./output
-python -m modular_pipeline.sfm ./output --backend glomap
+ls
 ```
+(Mac/Linux) or
+```bash
+dir
+```
+(Windows)
 
-**Why reframing is required:**
-- Equirectangular projection fails standard feature detection
-- Reframing creates 12 pinhole views with 30% overlap
-- COLMAP reconstructs the virtual rig geometry
+You should see `my_project` listed.
 
 ---
 
-### Automation (Presets)
+#### Step 3: Run the Automatic Pipeline
 
-For standard workflows, use the preset system:
-
+**For DJI Mavic 3 Pro:**
 ```bash
-# Mavic 3 Pro (includes camera intrinsics)
-python -m modular_pipeline.pipeline ./project --preset mavic_3_pro
-
-# Osmo 360 (auto-reframes + masks)
-python -m modular_pipeline.pipeline ./project --preset osmo_360
+python -m modular_pipeline.pipeline ./my_project --preset mavic_3_pro
 ```
 
-**Available Presets:**
-- `mavic_3_pro`: DJI Mavic 3 Pro (Hasselblad, 4/3" sensor, 24mm)
-- `mavic_air_2s`: DJI Mavic Air 2S (1" sensor, 22mm)
-- `osmo_360`: DJI Osmo Action 360 (auto-reframe + mask)
-- `drone`: Generic drone (no intrinsics)
-- `360`: Generic 360° camera
-- `default`: Standard pinhole camera
+**For DJI Mavic Air 2S:**
+```bash
+python -m modular_pipeline.pipeline ./my_project --preset mavic_air_2s
+```
 
-**Preset Advantage:** Presets include camera intrinsics (sensor size, focal length) that give SfM a better starting point → faster convergence, less calibration error.
+**For generic drone (if your model isn't listed):**
+```bash
+python -m modular_pipeline.pipeline ./my_project --preset drone
+```
+
+**What this command means:**
+- `python -m modular_pipeline.pipeline`: "Hey Python, run the MRP pipeline program"
+- `./my_project`: "Process the stuff in the folder called `my_project` right here"
+- `--preset mavic_3_pro`: "Use the Mavic 3 Pro settings"
+
+---
+
+#### Step 4: Wait
+
+Processing time depends on image count:
+- **1,000 images:** ~45 minutes
+- **6,900 images:** ~3 hours  
+- **10,000+ images:** 4-6 hours
+
+The terminal will show progress. Don't interrupt it.
+
+---
+
+#### Step 5: Get Your Result
+
+When finished, you'll have:
+
+```
+my_project/
+├── source/           # Your original images
+├── sparse/
+│   └── 0/
+│       ├── cameras.bin   ← Load this into PostShot
+│       ├── images.bin
+│       └── points3D.bin
+└── ... (other folders)
+```
+
+**To use in PostShot:**
+1. Open PostShot
+2. Import → COLMAP Project
+3. Navigate to `my_project/sparse/0/`
+4. Select all three `.bin` files
+5. Train!
+
+---
+
+### 360° Camera? (Osmo, Insta360, GoPro MAX)
+
+**Different workflow** because 360° needs reframing first.
+
+#### Your Folder Setup:
+
+```
+my_360_project/
+└── source/
+    └── my_video.mp4   (or equirectangular images)
+```
+
+#### Run This:
+
+```bash
+python -m modular_pipeline.pipeline ./my_360_project --preset osmo_360
+```
+
+The preset automatically:
+1. Extracts frames from video
+2. Reframes equirectangular → 12 pinhole views
+3. Removes tripod/selfie stick
+4. Runs reconstruction
+
+Result in `my_360_project/sparse/0/` (same as above).
+
+---
+
+### Advanced: Manual Control (Skip if Automated Works)
+
+**Only needed if:**
+- The preset fails
+- You need custom settings
+- You're debugging
+
+See [Module Reference](#3-module-reference) for detailed control over Extract, Match, and SfM stages.
+
+**Example (manual 3-step process):**
+
+```bash
+# Step 1: Extract features
+python -m modular_pipeline.extract ./my_project/source ./my_project/output
+
+# Step 2: Match features
+python -m modular_pipeline.match ./my_project/output/features.h5 ./my_project/output --retrieval netvlad
+
+# Step 3: Reconstruct
+python -m modular_pipeline.sfm ./my_project/output --backend glomap
+```
+
+**What `./` means:** "Right here in this folder." So `./my_project` means "the `my_project` folder in my current location."
 
 ---
 
