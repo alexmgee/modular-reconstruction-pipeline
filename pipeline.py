@@ -1,12 +1,12 @@
 """
-SplatForge Pipeline: Orchestrator for complete reconstruction workflows.
+MRP Pipeline: Orchestrator for complete reconstruction workflows.
 
 The Pipeline class chains individual stages together, handles configuration
 via presets, manages project state, and provides resumable execution.
 
 Usage:
     # Full pipeline with preset
-    from splatforge import Pipeline
+    from modular_pipeline import Pipeline
     
     pipeline = Pipeline("./my_project", preset="insta360_x5")
     result = pipeline.run()
@@ -759,7 +759,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Run SplatForge reconstruction pipeline",
+        description="Run MRP reconstruction pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
