@@ -21,7 +21,20 @@ A modular 3D reconstruction pipeline that converts raw capture data (video, imag
 
 ## 1. What This Pipeline Does
 
-### The Problem
+### It's Modular, Not Monolithic
+
+MRP is a **collection of specialized, independent tools** for 3D reconstruction. Each tool (module) solves a specific problem:
+
+- **Ingest:** Extract frames from video
+- **Reframe:** Convert 360° equirectangular to pinhole views
+- **Masking:** Remove people/cars/tripods from images
+- **Extract:** Detect keypoints with ALIKED/SuperPoint/XFeat
+- **Match:** Find correspondences with LightGlue/NetVLAD
+- **SfM:** Build 3D structure with GLOMAP/COLMAP
+
+**You can use modules individually** (just the masker, just the matcher) **or chain them together** (full automated pipeline).
+
+### The Problem MRP Solves
 
 Standard Structure-from-Motion (SfM) tools assume:
 - Pinhole camera geometry (fails on 360° equirectangular)
@@ -30,19 +43,29 @@ Standard Structure-from-Motion (SfM) tools assume:
 
 **When you have 6,900 drone images, 360° footage, or scenes with people/cars, traditional SfM pipelines fail.**
 
-### The Solution
+### How MRP Handles This
 
-MRP handles the edge cases that break standard reconstruction:
+Instead of a rigid, one-size-fits-all pipeline, MRP lets you **select only the modules you need:**
 
-1. **360° Projection → Pinhole:** Converts equirectangular to virtual camera rigs
-2. **Large-Scale Matching:** Uses intelligent retrieval (NetVLAD) to avoid O(n²) complexity
-3. **Dynamic Object Removal:** Masks people, vehicles, tripods before feature extraction
-4. **Camera Intrinsics:** Leverages known sensor parameters for faster convergence
+**Example 1:** You have 360° footage from an Insta360 camera.
+- **Use:** Ingest → Reframe → Masking → Extract → Match → SfM
+- **Automate:** `--preset osmo_360`
 
-**Result:** Clean COLMAP output ready for PostShot, Lichtfeld Studio, or gsplat training.
+**Example 2:** You have 6,900 drone images (already extracted, already pinhole).
+- **Use:** Extract → Match → SfM
+- **Automate:** `--preset mavic_3_pro`
+
+**Example 3:** You have a COLMAP project but the matcher choked on 10,000 images.
+- **Use:** *Just* the Match module with NetVLAD retrieval
+- **Run manually:** `python -m modular_pipeline.match features.h5 ./output --retrieval netvlad`
+
+**Example 4:** You need to remove people from 500 street photos before reconstruction.
+- **Use:** *Just* the Masking module
+- **Run manually:** `python -m modular_pipeline.prepare.masking ./photos ./masked --prompts "person"`
 
 ### What You Get
 
+**If you use the full pipeline:**
 ```
 Input                Output
 ─────────────────   ─────────────────────────
@@ -51,7 +74,24 @@ Input                Output
 Scenes w/people  → COLMAP reconstruction
 ```
 
-**Then:** Load into PostShot/Lichtfeld → Train Gaussian splat → Done.
+**If you use individual modules:**
+- Reframe: Pinhole views from 360° footage
+- Masking: Cleaned images with dynamic objects removed
+- Match: Feature correspondences for large datasets
+- SfM: Sparse 3D reconstruction
+
+**Then:** Load COLMAP output into PostShot/Lichtfeld → Train Gaussian splat → Done.
+
+### Why "Modular" Matters
+
+**Traditional pipelines:** One rigid workflow. If step 3 doesn't work, the entire pipeline fails.
+
+**MRP approach:** Pick what you need. If GLOMAP fails, swap in COLMAP. If LightGlue is slow, swap in SuperGlue. If you don't need masking, skip it.
+
+**Each module has:**
+- **Multiple backends** (ALIKED vs SuperPoint, GLOMAP vs COLMAP)
+- **Independent CLI** (use it standalone without the full pipeline)
+- **Configurable parameters** (see Module Reference section)
 
 ---
 
