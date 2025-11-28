@@ -828,7 +828,446 @@ Step 6: If too slow
 
 ---
 
-## Cascading Effects
+## Equipment & Workflow Reference (Your Setup)
+
+### Equipment Profiles & Presets
+
+#### DJI Mavic 3 Pro (Drone)
+**Best for:** Aerial surveys, wide coverage, systematic grid patterns
+
+**Preset:** `--preset mavic_3_pro`
+
+**Settings:**
+```bash
+--camera-model OPENCV              # Strong barrel distortion on this sensor
+--refine-intrinsics                # Optimize focal length + principal point
+--max-keypoints 8000               # Good balance for aerial imagery
+--subpixel-refinement              # Optional: adds precision
+--num-neighbors 50                 # NetVLAD: typical drone survey spacing
+--retrieval netvlad                # Unordered but spatially correlated
+```
+
+**Typical workflow:**
+```bash
+# From OSV (native DJI format)
+python -m modular_pipeline.pipeline ./statue_drone --preset mavic_3_pro
+
+# From extracted frames
+python -m modular_pipeline.pipeline ./statue_drone --preset mavic_3_pro
+```
+
+**Expect:** 90%+ registration rate, dense cloud, clean reconstruction.
+
+---
+
+#### DJI Mavic Air 2S (Drone)
+**Best for:** Similar to Mavic 3 Pro but slightly older sensor characteristics
+
+**Preset:** `--preset mavic_air_2s`
+
+**Settings:**
+```bash
+--camera-model OPENCV              # Similar distortion to Mavic 3 Pro
+--refine-intrinsics                # Always enable for DJI
+--max-keypoints 8000               # Standard
+--num-neighbors 50
+--retrieval netvlad
+```
+
+**Workflow:** Same as Mavic 3 Pro (preset handles it).
+
+---
+
+#### DJI Osmo Action 4 (360° Camera)
+**Best for:** Comprehensive 360° capture, environment scanning
+
+**Preset:** `--preset osmo_360`
+
+**Critical settings (must use):**
+```bash
+--rig-pattern ring12               # MUST: reframe to pinhole rig
+--projection-backend torch_gpu     # MUST: GPU acceleration for speed
+--masking person,tripod,selfie stick  # Remove visible stand/operator
+--geometry-aware True              # Pole region artifact handling
+--fov-h 90 --fov-v 60             # Standard 90° FOV per camera
+```
+
+**Full workflow:**
+```bash
+# Step 1: Extract frames from video
+python -m modular_pipeline.ingest.extract \
+  ./osmo360_video.mov \
+  ./statue_360 \
+  --target-fps 2 \
+  --filter-quality
+
+# Step 2: Full pipeline with reframe + mask + reconstruct
+python -m modular_pipeline.pipeline ./statue_360 \
+  --preset osmo_360 \
+  --masking person,tripod \
+  --rig-pattern ring12 \
+  --geometry-aware
+```
+
+**Output:** `statue_360/sparse/0/` with rig.json for COLMAP multi-camera handling.
+
+**Expect:** Good registration after reframing, temporal smoothing helps consistency.
+
+---
+
+#### Fuji XPro2 (DSLR with Interchangeable Lenses)
+**Best for:** High-quality detail capture, multiple perspectives, variable focal lengths
+
+**Preset:** None (use `standard`), but customize by lens
+
+**Settings (per lens):**
+```bash
+# Wide lens (18-55mm equivalent)
+--camera-model SIMPLE_RADIAL       # Fuji lenses: minimal distortion
+--max-keypoints 8000-12000         # Wider FOV = more texture
+--subpixel-refinement              # DSLR detail matters
+--refine-intrinsics                # Optimize for this specific lens
+
+# Standard lens (35mm equivalent)
+--camera-model SIMPLE_RADIAL
+--max-keypoints 8000
+--subpixel-refinement
+
+# Telephoto (50mm+)
+--camera-model SIMPLE_RADIAL
+--max-keypoints 6000               # Narrow FOV = fewer features per image
+--min-matches 10                   # Accept weaker matches (tighter baseline)
+```
+
+**Workflow (mixed lenses):**
+```bash
+# If all photos from same lens
+python -m modular_pipeline.pipeline ./statue_fuji \
+  --camera-model SIMPLE_RADIAL \
+  --max-keypoints 10000 \
+  --subpixel-refinement
+
+# If mixed lenses (wide + standard + tele)
+python -m modular_pipeline.pipeline ./statue_fuji \
+  --camera-mode per_folder \
+  --camera-model SIMPLE_RADIAL \
+  --max-keypoints 10000 \
+  --subpixel-refinement \
+  --run-bundle-adjustment True      # Critical for multi-focal-length
+```
+
+**Expect:** High quality, but variable registration depending on lens diversity.
+
+**Tips:**
+- Organize by lens folder for `--camera-mode per_folder`
+- EXIF includes focal length (pipeline uses it)
+- Telephoto photos may have fewer matches (wider baselines)
+
+---
+
+#### iPhone 16 Pro Max (Phone Camera)
+**Best for:** Quick supplemental capture, high resolution, computational photography
+
+**Settings:**
+```bash
+--camera-model OPENCV              # Phone sensors have barrel distortion
+--refine-intrinsics                # Optimize distortion model
+--max-keypoints 8000-12000         # High-res 12MP sensor
+--subpixel-refinement              # Precision helps
+--resize-max 2048                  # Don't downscale too much (keep detail)
+```
+
+**Workflow:**
+```bash
+# From Photos app export (assumes RAW or high-quality JPEG)
+python -m modular_pipeline.pipeline ./statue_iphone \
+  --camera-model OPENCV \
+  --max-keypoints 10000 \
+  --subpixel-refinement \
+  --refine-intrinsics
+```
+
+**Watch out:**
+- Auto-focus can vary between photos (focus breathing)
+- Computational photography may introduce artifacts
+- ISO variation between photos is normal
+
+---
+
+#### iPad Pro 2024 (Tablet Camera)
+**Best for:** Wide FOV supplemental capture, panoramic
+
+**Settings:**
+```bash
+--camera-model OPENCV              # Similar distortion to iPhone
+--refine-intrinsics
+--max-keypoints 8000
+--resize-max 1920                  # Smaller sensor than iPhone
+```
+
+**Workflow:** Similar to iPhone.
+
+**Note:** Wider FOV than iPhone, fewer reliable features per image.
+
+---
+
+### Common Single-Source Workflows
+
+#### Scenario A: All Drone (Mavic 3 Pro)
+**Your data:** OSV file from drone + extracted frames
+
+```bash
+# Option 1: Direct from OSV video
+python -m modular_pipeline.pipeline ./statue_drone --preset mavic_3_pro
+
+# Option 2: From already-extracted frames (if pre-processed)
+python -m modular_pipeline.pipeline ./statue_drone --preset mavic_3_pro
+```
+
+**Expected outcome:**
+- Registration: 95%+
+- Point count: 500K-2M
+- Time: ~2-3 hours (6900 images)
+- Quality: Excellent clean reconstruction
+
+---
+
+#### Scenario B: All 360° (Osmo Action 4)
+**Your data:** MOV file from 360° camera
+
+```bash
+# Full workflow (ingest + reframe + mask + reconstruct)
+python -m modular_pipeline.ingest.extract \
+  ./video.mov \
+  ./statue_360 \
+  --target-fps 2
+
+python -m modular_pipeline.pipeline ./statue_360 --preset osmo_360
+```
+
+**Expected outcome:**
+- Registration: 85-95% (reframing helps significantly)
+- Point count: 300K-1M
+- Time: ~2-3 hours
+- Quality: Good (pole/tripod removed)
+
+---
+
+#### Scenario C: All DSLR (Fuji XPro2)
+**Your data:** 300 JPEG files from multiple lenses
+
+```bash
+python -m modular_pipeline.pipeline ./statue_fuji \
+  --camera-model SIMPLE_RADIAL \
+  --max-keypoints 10000 \
+  --subpixel-refinement \
+  --run-bundle-adjustment True
+```
+
+**Expected outcome:**
+- Registration: 80-95% (depends on coverage)
+- Point count: 200K-800K (fewer images = fewer points)
+- Time: ~30-60 minutes
+- Quality: Very high (DSLR detail)
+
+---
+
+### Your Workflow: Roadside Statues (Mixed Data)
+
+**Setup:** Drone (5 min video) + 360° (5 min video) + DSLR Fuji (300 photos)
+
+**Decision:** Process separately, then compare or combine.
+
+#### Option 1: Separate Reconstructions (Recommended for testing)
+
+```bash
+# ============ DRONE PROCESSING ============
+# Extract drone video
+python -m modular_pipeline.ingest.extract \
+  ./drone.osv \
+  ./statue_drone_raw \
+  --target-fps 2 \
+  --filter-quality
+
+# Full drone pipeline
+python -m modular_pipeline.pipeline ./statue_drone_raw \
+  --preset mavic_3_pro \
+  --output-splat                           # Optional: train splat
+  --splat-iterations 30000
+
+# ============ 360° PROCESSING ============
+# Extract 360° video
+python -m modular_pipeline.ingest.extract \
+  ./osmo360.mov \
+  ./statue_360_raw \
+  --target-fps 2 \
+  --filter-quality
+
+# Full 360° pipeline
+python -m modular_pipeline.pipeline ./statue_360_raw \
+  --preset osmo_360 \
+  --masking person,tripod,selfie_stick
+
+# ============ DSLR PROCESSING ============
+python -m modular_pipeline.pipeline ./statue_fuji_raw \
+  --camera-model SIMPLE_RADIAL \
+  --max-keypoints 10000 \
+  --subpixel-refinement \
+  --run-bundle-adjustment True
+
+# ============ INSPECT RESULTS ============
+# Check each:
+# statue_drone_raw/sparse/0/ → registration rate, point count
+# statue_360_raw/sparse/0/   → registration rate, point count
+# statue_fuji_raw/sparse/0/  → registration rate, point count
+```
+
+**Then decide:** Which is best? Combine them? Use drone + DSLR for detail?
+
+---
+
+#### Option 2: Combined Reconstruction (Advanced)
+
+**Goal:** Single 3D model using all data sources
+
+**Warning:** This is complex; only if individual reconstructions are all good (>90% registration).
+
+```bash
+# Combine image sources into single folder
+mkdir statue_combined
+cp statue_drone_raw/frames/* statue_combined/
+cp statue_360_raw/reframed/rig_views/* statue_combined/  # Post-reframed
+cp statue_fuji_raw/frames/* statue_combined/
+
+# Run single extraction + matching + SfM
+python -m modular_pipeline.extract ./statue_combined ./output \
+  --max-keypoints 8000
+
+python -m modular_pipeline.match ./output/features.h5 ./output \
+  --retrieval netvlad \
+  --num-neighbors 100              # More candidates (mixed sensors)
+
+python -m modular_pipeline.sfm ./output \
+  --camera-model SIMPLE_RADIAL \
+  --camera-mode per_folder \
+  --run-bundle-adjustment True
+```
+
+**Tradeoff:**
+- ✅ Single unified reconstruction
+- ❌ Complex multi-camera bundle adjustment
+- ❌ Mixed image qualities may cause issues
+- ⚠️ Only attempt if individual sources all work
+
+---
+
+#### Option 3: Drone + DSLR (Practical Hybrid)
+
+**Best approach for your statues:** High-res context (drone) + detail (DSLR)
+
+```bash
+# Organize data
+mkdir statue_hybrid
+mkdir statue_hybrid/drone_frames    # From extracted drone video
+mkdir statue_hybrid/dslr_frames     # Your 300 Fuji photos
+
+cp statue_drone_raw/frames/* statue_hybrid/drone_frames/
+cp statue_fuji_raw/frames/* statue_hybrid/dslr_frames/
+
+# Run combined pipeline with per-folder camera mode
+python -m modular_pipeline.extract ./statue_hybrid ./output \
+  --max-keypoints 8000
+
+python -m modular_pipeline.retrieve ./statue_hybrid ./output \
+  --backend hybrid                  # Sequential (drone) + NetVLAD (DSLR)
+  --num-neighbors 50
+
+python -m modular_pipeline.match ./output/features.h5 ./output \
+  --retrieval hybrid \
+  --num-neighbors 50
+
+python -m modular_pipeline.sfm ./output \
+  --camera-model OPENCV            # Drone (OPENCV) dominates
+  --camera-mode per_folder \
+  --run-bundle-adjustment True
+
+# Train splat
+python -m modular_pipeline.output.splat ./output \
+  --backend gsplat \
+  --num-iterations 40000 \
+  --sh-degree 3
+```
+
+**Result:**
+- Drone provides coverage, DSLR provides detail
+- Temporal consistency (drone video) + spatial detail (DSLR stills)
+- ~1M-3M 3D points
+- Good splat training data
+
+---
+
+### Quick Decision: Which Approach for Your Project?
+
+```
+Do you want to test each source individually?
+├─ Yes → Option 1 (Separate, compare results)
+└─ No → Do drone + DSLR coverage + detail matter equally?
+   ├─ Yes → Option 3 (Hybrid: best practical approach)
+   └─ No → Just use best single source (probably drone or DSLR)
+```
+
+**My recommendation for roadside statues:** **Option 3 (Hybrid Drone + DSLR)**
+- Drone gives you the environment (context, lighting, scale)
+- DSLR gives you fine detail (statue texture, weathering, inscriptions)
+- Combined → rich, detailed reconstruction perfect for Gaussian splatting
+
+---
+
+### Running Your First Project
+
+**Copy-paste ready (roadside statues example):**
+
+```bash
+# Set up directories
+mkdir -p roadside_statues/{drone,dslr}
+
+# Place your files
+# Put extracted drone frames in: roadside_statues/drone/
+# Put your DSLR photos in: roadside_statues/dslr/
+
+# Run the pipeline
+python -m modular_pipeline.pipeline ./roadside_statues \
+  --max-keypoints 8000 \
+  --camera-mode per_folder \
+  --retrieval hybrid \
+  --num-neighbors 50 \
+  --mapper glomap \
+  --camera-model OPENCV \
+  --refine-intrinsics \
+  --run-bundle-adjustment True
+
+# Check results
+ls -la roadside_statues/sparse/0/
+
+# Train splat
+python -m modular_pipeline.output.splat ./roadside_statues \
+  --backend gsplat \
+  --num-iterations 40000 \
+  --sh-degree 3
+
+# Final model in: roadside_statues/output/splat/trained.ply
+```
+
+**Time estimate:**
+- Extract: 10 min
+- Match: 20 min
+- SfM: 5 min
+- Splat training: 20 min
+- **Total: ~1 hour**
+
+---
+
+
 
 **Increase max_keypoints 8K→16K:**
 ```
