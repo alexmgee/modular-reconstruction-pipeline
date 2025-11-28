@@ -29,13 +29,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple, Set
 import time
 import logging
+import shutil
+import os
+import signal
+import sys
+from tqdm import tqdm
 
 # Core imports
 from modular_pipeline.core import (
     BaseModule, BaseConfig, StageResult, ItemResult,
     QualityLevel, Backend,
     ensure_directory, format_time,
-    HAS_TORCH, HAS_NUMPY
+    SafeIO, HAS_TORCH, HAS_NUMPY
 )
 
 # Lazy imports
@@ -71,6 +76,7 @@ class RetrievalBackend(Enum):
     VOCAB_TREE = "vocab_tree"   # COLMAP vocab tree
     EXHAUSTIVE = "exhaustive"   # All pairs (small datasets only)
     SEQUENTIAL = "sequential"   # Video sequences
+    HYBRID = "hybrid"           # Sequential + NetVLAD
 
 
 @dataclass
@@ -113,6 +119,7 @@ class MatchConfig(BaseConfig):
     
     # Output
     output_format: str = "h5"
+    force: bool = False             # Force overwrite of existing files
     
     def __post_init__(self):
         super().__post_init__()
@@ -159,6 +166,7 @@ class FeatureMatcher(BaseModule):
         self._fallback_matcher = None
         self._retrieval_model = None
         
+        print(f"Initializing matcher: {self.config.matcher.value}...", flush=True)
         # Load primary matcher
         self._load_matcher(self.config.matcher, primary=True)
         
@@ -168,6 +176,7 @@ class FeatureMatcher(BaseModule):
                 self._load_matcher(self.config.fallback_matcher, primary=False)
             except Exception as e:
                 self.log(f"Fallback matcher unavailable: {e}", "warning")
+        print("Matcher initialization complete.", flush=True)
     
     def _load_matcher(self, backend: MatcherBackend, primary: bool = True) -> None:
         """Load a matcher model."""
@@ -259,6 +268,18 @@ class FeatureMatcher(BaseModule):
         output_path = Path(output_path)
         ensure_directory(output_path)
         
+        # Determine paths
+        matches_path = output_path / 'matches.h5'
+        
+        # SAFEGUARD: Check existence
+        if matches_path.exists() and not self.config.force:
+            # Check if this is a resume
+            checkpoint = SafeIO.load_checkpoint("matches", output_path)
+            if not checkpoint.get("processed"):
+                self.log(f"Output file exists: {matches_path}", "error")
+                self.log("Use --force to overwrite or existing checkpoint to resume", "error")
+                return self._create_result(success=False, output_path=matches_path, errors=["File exists"])
+        
         # Load features
         if not features_path.exists():
             return self._create_result(
@@ -267,6 +288,7 @@ class FeatureMatcher(BaseModule):
                 errors=[f"Features file not found: {features_path}"]
             )
         
+        print(f"Reading features from {features_path.name}...", flush=True)
         with h5py.File(features_path, 'r') as f:
             image_names = list(f.keys())
         
@@ -284,6 +306,7 @@ class FeatureMatcher(BaseModule):
                     output_path=output_path,
                     errors=["images_path required when pairs_path not provided"]
                 )
+            print("Generating pairs...", flush=True)
             pairs = self._generate_pairs(images_path, image_names)
             
             # Save pairs
@@ -298,15 +321,90 @@ class FeatureMatcher(BaseModule):
                 errors=["No pairs to match"]
             )
         
+        # SAFEGUARD: Checkpoint & Resume
+        if self.config.force:
+            # Clear checkpoint if forcing overwrite
+            checkpoint_path = output_path / ".matches.checkpoint.json"
+            if checkpoint_path.exists():
+                self.log("Force mode: Clearing existing checkpoint")
+                checkpoint_path.unlink()
+            processed_set = set()
+        else:
+            checkpoint = SafeIO.load_checkpoint("matches", output_path)
+            processed_set = set(checkpoint.get("processed", []))
+            if processed_set:
+                self.log(f"Resuming matching: {len(processed_set)} pairs already processed")
+        
         # Match features
         start_time = time.perf_counter()
-        matches_path = output_path / 'matches.h5'
         
-        results, failed_pairs = self._match_pairs(
-            features_path, 
-            pairs, 
-            matches_path
+        # SAFEGUARD: Process Lock
+        try:
+            print("Acquiring process lock...", flush=True)
+            with SafeIO.process_lock("matches", output_path):
+                # SAFEGUARD: Rolling backup
+                if matches_path.exists() and self.config.force and not processed_set:
+                    print("Backing up existing file...", flush=True)
+                    SafeIO.backup_file(matches_path)
+                
+                print(f"Starting matching loop for {len(pairs)} pairs...", flush=True)
+                results, failed_pairs = self._match_pairs(
+                    features_path, 
+                    pairs, 
+                    matches_path,
+                    processed_set
+                )
+                
+                # Retry failed pairs with fallback
+                if failed_pairs and self._fallback_matcher:
+                    self.log(f"\nRetrying {len(failed_pairs)} pairs with fallback matcher...")
+                    fallback_results = self._match_pairs_fallback(
+                        features_path,
+                        failed_pairs[:self.config.max_pairs_fallback],
+                        matches_path
+                    )
+                    results.extend(fallback_results)
+                
+                # Final integrity manifest
+                SafeIO.save_integrity_manifest(matches_path, SafeIO.compute_hash(matches_path))
+                
+        except RuntimeError as e:
+            return self._create_result(success=False, output_path=output_path, errors=[str(e)])
+        
+        # Statistics
+        elapsed = time.perf_counter() - start_time
+        successful = [r for r in results if r.success]
+        total_matches = sum(r.metrics.get('num_matches', 0) for r in successful)
+        
+        quality, confidence = self._aggregate_quality(results)
+        
+        self.log(f"\nMatching complete in {format_time(elapsed)}")
+        self.log(f"  Pairs matched: {len(successful)}/{len(pairs)}")
+        self.log(f"  Total matches: {total_matches:,}")
+        self.log(f"  Average: {total_matches/len(successful):.0f} per pair" if successful else "")
+        
+        result = self._create_result(
+            success=len(successful) > 0,
+            output_path=matches_path,
+            items_processed=len(successful),
+            items_failed=len(pairs) - len(successful),
+            processing_time=elapsed,
+            quality=quality,
+            confidence=confidence,
+            metrics={
+                'total_matches': total_matches,
+                'average_matches': total_matches / len(successful) if successful else 0,
+                'pairs_total': len(pairs),
+                'pairs_successful': len(successful),
+                'pairs_fallback': len(failed_pairs) if self._fallback_matcher else 0,
+                'matcher': self.config.matcher.value,
+            }
         )
+        
+        if self.config.save_manifests:
+            result.save_manifest()
+        
+        return result
         
         # Retry failed pairs with fallback
         if failed_pairs and self._fallback_matcher:
@@ -357,7 +455,8 @@ class FeatureMatcher(BaseModule):
         self,
         features_path: Path,
         pairs: List[Tuple[str, str]],
-        output_path: Path
+        output_path: Path,
+        processed_set: Set[str]
     ) -> Tuple[List[ItemResult], List[Tuple[str, str]]]:
         """Match all pairs with primary matcher."""
         import torch
@@ -365,10 +464,24 @@ class FeatureMatcher(BaseModule):
         results = []
         failed_pairs = []
         
+        # Use 'a' (append) mode allows building incrementally
+        mode = 'a' if output_path.exists() else 'w'
+        
+        # Use tqdm for progress bar
+        pbar = tqdm(total=len(pairs), desc="Matching features", 
+                   initial=len(processed_set), unit="pair") if self.config.verbose else None
+        
         with h5py.File(features_path, 'r') as feat_h5, \
-             h5py.File(output_path, 'w') as match_h5:
+             h5py.File(output_path, mode) as match_h5:
             
             for i, (name0, name1) in enumerate(pairs):
+                pair_key = f"{name0}/{name1}"
+                
+                # Resuming?
+                if pair_key in processed_set:
+                    if pbar: pbar.update(1)
+                    continue
+                    
                 try:
                     # Load features
                     kp0 = feat_h5[name0]['keypoints'][:]
@@ -383,7 +496,8 @@ class FeatureMatcher(BaseModule):
                     )
                     elapsed = time.perf_counter() - start
                     
-                    num_matches = len(matches)
+                    # Count valid matches (where match index > -1)
+                    num_matches = int((matches > -1).sum())
                     
                     # Quality assessment
                     if num_matches >= self.config.fallback_threshold:
@@ -399,7 +513,10 @@ class FeatureMatcher(BaseModule):
                         failed_pairs.append((name0, name1))
                     
                     # Store matches
-                    pair_key = f"{name0}/{name1}"
+                    # Only delete if group exists (e.g. from partial write)
+                    if pair_key in match_h5:
+                        del match_h5[pair_key]
+                        
                     grp = match_h5.create_group(pair_key)
                     grp.create_dataset('matches0', data=matches)
                     if scores is not None:
@@ -414,19 +531,37 @@ class FeatureMatcher(BaseModule):
                         metrics={'num_matches': num_matches}
                     ))
                     
-                    # Progress
-                    if self.config.verbose and (i + 1) % 500 == 0:
-                        self.log(f"  [{i+1}/{len(pairs)}] matched")
+                    # Checkpoint every 100 pairs
+                    processed_set.add(pair_key)
+                    if len(processed_set) % 100 == 0:
+                        SafeIO.save_checkpoint("matches", output_path.parent, {
+                            "processed": list(processed_set),
+                            "last_processed": pair_key
+                        })
+                        match_h5.flush() # Ensure data is on disk
+                    
+                    # Update progress bar
+                    if pbar:
+                        pbar.update(1)
+                        pbar.set_postfix(matches=num_matches)
                 
                 except Exception as e:
+                    # Print exception immediately for debugging
+                    if i < 10:  # Only print first 10 errors to avoid spam
+                        self.log(f"Error matching {name0} <-> {name1}: {e}", "error")
+                        import traceback
+                        traceback.print_exc()
                     results.append(ItemResult(
-                        item_id=f"{name0}/{name1}",
+                        item_id=pair_key,
                         success=False,
                         quality=QualityLevel.REJECT,
                         confidence=0.0,
                         error=str(e)
                     ))
         
+        if pbar:
+            pbar.close()
+            
         return results, failed_pairs
     
     def _match_pair_lightglue(
@@ -434,21 +569,38 @@ class FeatureMatcher(BaseModule):
         kp0: np.ndarray,
         desc0: np.ndarray,
         kp1: np.ndarray,
-        desc1: np.ndarray
+        desc1: np.ndarray,
+        size0: Optional[Tuple[int, int]] = None,
+        size1: Optional[Tuple[int, int]] = None
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """Match a single pair using LightGlue."""
         import torch
         
         device = self.device
         
-        # Prepare data
+        # Infer image size from keypoint ranges if not provided
+        if size0 is None:
+            # Use max keypoint coordinate + small margin as proxy for image size
+            h0 = int(kp0[:, 1].max()) + 100 if len(kp0) > 0 else 1000
+            w0 = int(kp0[:, 0].max()) + 100 if len(kp0) > 0 else 1000
+            size0 = (h0, w0)
+        if size1 is None:
+            h1 = int(kp1[:, 1].max()) + 100 if len(kp1) > 0 else 1000
+            w1 = int(kp1[:, 0].max()) + 100 if len(kp1) > 0 else 1000
+            size1 = (h1, w1)
+        
+        # Prepare data - LightGlue expects nested dicts with image0/image1 containing all fields
         data = {
-            'keypoints0': torch.from_numpy(kp0)[None].to(device),
-            'keypoints1': torch.from_numpy(kp1)[None].to(device),
-            'descriptors0': torch.from_numpy(desc0)[None].to(device),
-            'descriptors1': torch.from_numpy(desc1)[None].to(device),
-            'image0': {'image_size': torch.tensor([[1000, 1000]]).to(device)},
-            'image1': {'image_size': torch.tensor([[1000, 1000]]).to(device)},
+            'image0': {
+                'keypoints': torch.from_numpy(kp0)[None].float().to(device),
+                'descriptors': torch.from_numpy(desc0)[None].float().to(device),
+                'image_size': torch.tensor([[size0[1], size0[0]]]).to(device),  # (W, H) format
+            },
+            'image1': {
+                'keypoints': torch.from_numpy(kp1)[None].float().to(device),
+                'descriptors': torch.from_numpy(desc1)[None].float().to(device),
+                'image_size': torch.tensor([[size1[1], size1[0]]]).to(device),  # (W, H) format
+            },
         }
         
         # Match
@@ -460,17 +612,10 @@ class FeatureMatcher(BaseModule):
         if scores is not None:
             scores = scores[0].cpu().numpy()
         
-        # Filter valid matches
-        valid = matches >= 0
-        match_indices = np.stack([
-            np.where(valid)[0],
-            matches[valid]
-        ], axis=1)
-        
-        if scores is not None:
-            scores = scores[valid]
-        
-        return match_indices, scores
+        # Return raw results for hloc compatibility
+        # matches: 1D array where matches[i] = j (or -1)
+        # scores: 1D array of scores for all keypoints
+        return matches, scores
     
     def _match_pairs_fallback(
         self,
@@ -501,8 +646,9 @@ class FeatureMatcher(BaseModule):
             from modular_pipeline.reconstruct.retrieve import RetrievalModule, RetrievalConfig
             
             # Create retrieval config from match config
+            # Pass backend as string to avoid Enum mismatch between modules
             retrieval_config = RetrievalConfig(
-                backend=self.config.retrieval,
+                backend=self.config.retrieval.value,
                 num_neighbors=self.config.num_neighbors,
                 sequential_window=self.config.num_neighbors,
                 device=self.config.device,
@@ -632,7 +778,7 @@ def main():
     
     # Retrieval settings
     parser.add_argument("--retrieval", type=str, default="netvlad",
-                       choices=["netvlad", "sequential", "exhaustive"],
+                       choices=["netvlad", "hybrid", "sequential", "exhaustive", "cosplace", "vocab_tree"],
                        help="Pair selection method")
     parser.add_argument("--neighbors", type=int, default=50,
                        help="Number of retrieval neighbors")
@@ -643,6 +789,7 @@ def main():
     parser.add_argument("--filter-threshold", type=float, default=0.1,
                        help="Match confidence threshold")
     
+    parser.add_argument("--force", action="store_true", help="Overwrite existing files")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("-v", "--verbose", action="store_true")
     
@@ -656,6 +803,7 @@ def main():
         num_neighbors=args.neighbors,
         min_matches=args.min_matches,
         filter_threshold=args.filter_threshold,
+        force=args.force,
         device=args.device,
         verbose=args.verbose,
     )

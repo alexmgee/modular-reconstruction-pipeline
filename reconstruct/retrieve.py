@@ -57,6 +57,7 @@ class RetrievalBackend(Enum):
     VOCAB_TREE = "vocab_tree"     # COLMAP vocabulary tree
     SEQUENTIAL = "sequential"     # Video sequences
     EXHAUSTIVE = "exhaustive"     # All pairs (O(n²), small datasets only)
+    HYBRID = "hybrid"             # Sequential + NetVLAD (Video + Loop closure)
 
 
 @dataclass
@@ -102,7 +103,10 @@ class RetrievalConfig(BaseConfig):
     output_format: str = "txt"        # txt or json
     
     def __post_init__(self):
-        super().__post_init__()
+        # Do NOT call super().__post_init__() because BaseConfig tries to
+        # convert self.backend to core.Backend, but we use RetrievalBackend here.
+        # This shadows the parent 'backend' field with a different Enum type.
+        
         if isinstance(self.backend, str):
             self.backend = RetrievalBackend(self.backend)
 
@@ -149,7 +153,7 @@ class RetrievalModule(BaseModule):
         """Load global descriptor model."""
         backend = self.config.backend
         
-        if backend == RetrievalBackend.NETVLAD:
+        if backend in [RetrievalBackend.NETVLAD, RetrievalBackend.HYBRID]:
             try:
                 # Try to use hloc's NetVLAD
                 from hloc import extract_features
@@ -158,7 +162,11 @@ class RetrievalModule(BaseModule):
                 return
             except ImportError:
                 self.log("HLOC not available, will use sequential fallback", "warning")
-                self.config.backend = RetrievalBackend.SEQUENTIAL
+                if backend == RetrievalBackend.HYBRID:
+                    self.log("Hybrid mode degrading to Sequential only", "warning")
+                    self.config.backend = RetrievalBackend.SEQUENTIAL
+                else:
+                    self.config.backend = RetrievalBackend.SEQUENTIAL
                 return
         
         elif backend == RetrievalBackend.COSPLACE:
@@ -172,8 +180,9 @@ class RetrievalModule(BaseModule):
                 self.config.backend = RetrievalBackend.SEQUENTIAL
         
         # Fallback to sequential
-        self.config.backend = RetrievalBackend.SEQUENTIAL
-        self._backend_name = "sequential"
+        if backend != RetrievalBackend.SEQUENTIAL and backend != RetrievalBackend.EXHAUSTIVE:
+            self.config.backend = RetrievalBackend.SEQUENTIAL
+            self._backend_name = "sequential"
     
     # -------------------------------------------------------------------------
     # Processing
@@ -230,7 +239,9 @@ class RetrievalModule(BaseModule):
         elif self.config.backend == RetrievalBackend.SEQUENTIAL:
             pairs = self._generate_sequential(image_names)
         elif self.config.backend == RetrievalBackend.NETVLAD:
-            pairs = self._generate_netvlad(images_path, image_names)
+            pairs = self._generate_netvlad(images_path, image_names, output_path.parent)
+        elif self.config.backend == RetrievalBackend.HYBRID:
+            pairs = self._generate_hybrid(images_path, image_names, output_path.parent)
         elif self.config.backend == RetrievalBackend.VOCAB_TREE:
             pairs = self._generate_vocab_tree(images_path, image_names)
         else:
@@ -324,24 +335,106 @@ class RetrievalModule(BaseModule):
     def _generate_netvlad(
         self,
         images_path: Path,
-        image_names: List[str]
+        image_names: List[str],
+        export_dir: Path
     ) -> List[Tuple[str, str]]:
         """Generate pairs using NetVLAD global descriptors."""
         try:
             from hloc import extract_features, pairs_from_retrieval
             
-            # This is a simplified stub - full implementation would:
-            # 1. Extract NetVLAD descriptors for all images
-            # 2. Compute k-NN in descriptor space
-            # 3. Generate pairs from neighbors
+            # Path for global descriptors
+            # We place it in /features/global-feats-netvlad.h5 if possible, or alongside output
+            # Try to infer "features" dir from export_dir (which is matches dir)
+            if export_dir.name == "matches":
+                features_dir = export_dir.parent / "features"
+            else:
+                features_dir = export_dir
             
-            self.log("NetVLAD retrieval requires full HLOC setup", "warning")
+            ensure_directory(features_dir)
+            global_descriptors_path = features_dir / 'global-feats-netvlad.h5'
+            
+            # 1. Extract NetVLAD descriptors
+            conf = extract_features.confs['netvlad']
+            self.log(f"Extracting NetVLAD descriptors to {global_descriptors_path}...")
+            
+            # We need to pass list of images relative to images_path if image_list provided
+            # hloc.extract_features expects image_list as list of paths relative to image_dir
+            # image_names are already basenames relative to images_path in our pipeline usually
+            
+            # Note: hloc modifies logger, we might want to capture output
+            extract_features.main(
+                conf=conf,
+                image_dir=images_path,
+                export_dir=features_dir,
+                image_list=image_names if image_names else None,
+                feature_path=global_descriptors_path,
+                overwrite=False # Cache if exists
+            )
+            
+            # 2. Generate pairs from retrieval
+            self.log(f"Generating NetVLAD pairs (k={self.config.num_neighbors})...")
+            
+            # We use a temp file for hloc output then parse it
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                temp_pairs_path = Path(f.name)
+            
+            pairs_from_retrieval.main(
+                global_descriptors_path,
+                temp_pairs_path,
+                num_matched=self.config.num_neighbors,
+                db_prefix="", # image_dir prefix not needed for standard usage
+            )
+            
+            # 3. Load pairs
+            pairs = self.load_pairs(temp_pairs_path)
+            temp_pairs_path.unlink()
+            
+            return pairs
+            
+        except Exception as e:
+            self.log(f"NetVLAD retrieval failed: {e}", "error")
+            import traceback
+            traceback.print_exc()
             self.log("Falling back to sequential pairing", "warning")
             return self._generate_sequential(image_names)
-            
-        except ImportError:
-            self.log("HLOC not available, using sequential pairing", "warning")
-            return self._generate_sequential(image_names)
+
+    def _generate_hybrid(
+        self,
+        images_path: Path,
+        image_names: List[str],
+        export_dir: Path
+    ) -> List[Tuple[str, str]]:
+        """Generate both sequential and retrieval pairs."""
+        
+        # 1. Sequential pairs (video continuity)
+        seq_pairs = self._generate_sequential(image_names)
+        self.log(f"Generated {len(seq_pairs)} sequential pairs")
+        
+        # 2. NetVLAD pairs (loop closure)
+        # Use half the neighbors for retrieval to balance count
+        original_neighbors = self.config.num_neighbors
+        self.config.num_neighbors = max(10, original_neighbors // 2)
+        
+        ret_pairs = self._generate_netvlad(images_path, image_names, export_dir)
+        
+        # Restore config
+        self.config.num_neighbors = original_neighbors
+        
+        self.log(f"Generated {len(ret_pairs)} retrieval pairs")
+        
+        # 3. Merge and deduplicate
+        all_pairs_set = set(seq_pairs)
+        
+        # Normalize order for retrieval pairs to check dups
+        for p1, p2 in ret_pairs:
+            if (p1, p2) not in all_pairs_set and (p2, p1) not in all_pairs_set:
+                all_pairs_set.add((p1, p2))
+        
+        merged_pairs = list(all_pairs_set)
+        self.log(f"Merged hybrid pairs: {len(merged_pairs)} (deduplicated)")
+        
+        return merged_pairs
     
     def _generate_vocab_tree(
         self,
@@ -400,8 +493,8 @@ def main():
     
     # Backend settings
     parser.add_argument("--backend", type=str, default="sequential",
-                       choices=["netvlad", "cosplace", "vocab_tree", "sequential", "exhaustive"],
-                       help="Retrieval backend")
+                       choices=["netvlad", "hybrid", "cosplace", "vocab_tree", "sequential", "exhaustive"],
+                       help="Retrieval backend (hybrid = sequential + netvlad)")
     parser.add_argument("--neighbors", type=int, default=50,
                        help="Number of neighbors per image (k-NN)")
     parser.add_argument("--max-pairs", type=int, default=1_000_000,
