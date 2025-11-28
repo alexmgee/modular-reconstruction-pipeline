@@ -1,782 +1,1309 @@
 # MRP: Modular Reconstruction Pipeline
 
-A modular 3D reconstruction pipeline that converts raw capture data (video, images, 360° footage) into COLMAP sparse reconstructions for Gaussian splatting training.
+**A production-grade SfM pipeline for experts who need control.**
 
-**Primary Output:** COLMAP sparse reconstruction (`cameras.bin`, `images.bin`, `points3D.bin`)
+MRP is a modular photogrammetry framework designed to handle diverse capture scenarios—from drone surveys to 360° video to challenging urban scenes with dynamic objects—while maintaining full transparency and control over every stage of reconstruction.
+
+**Output:** COLMAP sparse reconstructions (`cameras.bin`, `images.bin`, `points3D.bin`) compatible with NeRF/Gaussian splatting training frameworks.
 
 ---
 
 ## Table of Contents
 
-1. [What This Pipeline Does](#1-what-this-pipeline-does)
-2. [Pipeline Architecture](#2-pipeline-architecture)
+1. [Why Modular?](#1-why-modular)
+2. [Architecture & Data Flow](#2-architecture--data-flow)
 3. [Module Reference](#3-module-reference)
-4. [Installation](#4-installation)
-5. [Quick Start](#5-quick-start)
-6. [Configuration](#6-configuration)
-7. [Output Formats](#7-output-formats)
+4. [Parameter Tuning Guide](#4-parameter-tuning-guide)
+5. [Installation](#5-installation)
+6. [Usage](#6-usage)
+7. [Quality Assessment](#7-quality-assessment)
 8. [Troubleshooting](#8-troubleshooting)
 
 ---
 
-## 1. What This Pipeline Does
+## 1. Why Modular?
 
-### It's Modular, Not Monolithic
+Standard SfM pipelines (COLMAP, Metashape) make assumptions that fail in specific scenarios:
 
-MRP is a **collection of specialized, independent tools** for 3D reconstruction. Each tool (module) solves a specific problem:
+| Assumption | Breaks When | MRP Solution |
+|-----------|-------------|--------------|
+| Pinhole geometry | 360° equirectangular footage | `reframe` module: project to pinhole rig |
+| Static scene | Moving people, vehicles, tripods | `masking` module: remove with SAM3 + temporal consistency |
+| Small-to-medium datasets | >5000 images | Staged matching: NetVLAD retrieval + fallback matchers |
+| Single extractor works | ALIKED/SuperPoint tradeoffs | Swap extractors: ALIKED (quality) vs XFeat (speed) vs DISK (density) |
+| Incremental SfM works everywhere | Global scenes | Choose backends: GLOMAP (global) vs COLMAP (incremental) |
 
-- **Ingest:** Extract frames from video
-- **Reframe:** Convert 360° equirectangular to pinhole views
-- **Masking:** Remove people/cars/tripods from images
-- **Extract:** Detect keypoints with ALIKED/SuperPoint/XFeat
-- **Match:** Find correspondences with LightGlue/NetVLAD
-- **SfM:** Build 3D structure with GLOMAP/COLMAP
+**The modular approach:** Each stage is independent, with multiple backends and transparent configurations. Debug or replace any stage without rerunning others.
 
-**You can use modules individually** (just the masker, just the matcher) **or chain them together** (full automated pipeline).
-
-### The Problem MRP Solves
-
-Standard Structure-from-Motion (SfM) tools assume:
-- Pinhole camera geometry (fails on 360° equirectangular)
-- Small-to-medium datasets (<1000 images)
-- Clean scenes (no moving objects, tripods, or dynamic content)
-
-**When you have 6,900 drone images, 360° footage, or scenes with people/cars, traditional SfM pipelines fail.**
-
-### How MRP Handles This
-
-Instead of a rigid, one-size-fits-all pipeline, MRP lets you **select only the modules you need:**
-
-**Example 1:** You have 360° footage from an Insta360 camera.
-- **Use:** Ingest → Reframe → Masking → Extract → Match → SfM
-- **Automate:** `--preset osmo_360`
-
-**Example 2:** You have 6,900 drone images (already extracted, already pinhole).
-- **Use:** Extract → Match → SfM
-- **Automate:** `--preset mavic_3_pro`
-
-**Example 3:** You have a COLMAP project but the matcher choked on 10,000 images.
-- **Use:** *Just* the Match module with NetVLAD retrieval
-- **Run manually:** `python -m modular_pipeline.match features.h5 ./output --retrieval netvlad`
-
-**Example 4:** You need to remove people from 500 street photos before reconstruction.
-- **Use:** *Just* the Masking module
-- **Run manually:** `python -m modular_pipeline.prepare.masking ./photos ./masked --prompts "person"`
-
-### What You Get
-
-**If you use the full pipeline:**
-```
-Input                Output
-─────────────────   ─────────────────────────
-6,900 drone pics → COLMAP reconstruction
-360° video       → COLMAP reconstruction  
-Scenes w/people  → COLMAP reconstruction
-```
-
-**If you use individual modules:**
-- Reframe: Pinhole views from 360° footage
-- Masking: Cleaned images with dynamic objects removed
-- Match: Feature correspondences for large datasets
-- SfM: Sparse 3D reconstruction
-
-**Then:** Load COLMAP output into PostShot/Lichtfeld → Train Gaussian splat → Done.
-
-### Why "Modular" Matters
-
-**Traditional pipelines:** One rigid workflow. If step 3 doesn't work, the entire pipeline fails.
-
-**MRP approach:** Pick what you need. If GLOMAP fails, swap in COLMAP. If LightGlue is slow, swap in SuperGlue. If you don't need masking, skip it.
-
-**Each module has:**
-- **Multiple backends** (ALIKED vs SuperPoint, GLOMAP vs COLMAP)
-- **Independent CLI** (use it standalone without the full pipeline)
-- **Configurable parameters** (see Module Reference section)
+**When you'd use this instead of COLMAP directly:**
+- You have 360° footage (manual rig projection is tedious)
+- You have >5000 images (exhaustive matching is infeasible)
+- You have masking requirements (preprocessing with traditional CV is outdated)
+- You want to experiment with feature extractors (swap ALIKED ↔ XFeat without reruns)
+- You want full audit trail (manifests at each stage with quality metrics)
 
 ---
 
-## 2. Pipeline Architecture
+## 2. Architecture & Data Flow
 
-### Data Flow
+### 2.1 Pipeline Stages
 
 ```
-INPUT (Raw Data)
+[INPUT: Video/Images/360° Footage]
     ↓
-┌─────────────┐
-│   INGEST    │  Extract frames + metadata from video
-└──────┬──────┘
-       ↓
-┌─────────────┐
-│   PREPARE   │  Fix geometry (360°→pinhole) + Remove objects (masking)
-└──────┬──────┘
-       ↓
-┌─────────────┐
-│ RECONSTRUCT │  Extract features → Match → Build 3D structure
-│  (3 stages) │  [This is the configurable engine]
-└──────┬──────┘
-       ↓
-OUTPUT (COLMAP sparse/0/)
+┌─────────────────────────────────────────────────┐
+│ INGEST (Conditional)                            │
+│ Input: Video files, image folders, OSV format   │
+│ - Source type detection                         │
+│ - Frame extraction + EXIF parsing               │
+│ - Quality filtering (blur, exposure)            │
+│ Output: frames/ + metadata.json                 │
+└─────────────────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────────────────┐
+│ PREPARE (Conditional: Geometry Fix + Masking)   │
+│                                                  │
+│ ┌──────────────────────────────────────────┐    │
+│ │ REFRAME (if 360° equirectangular)        │    │
+│ │ - Project to pinhole rig (cube/ring/geo) │    │
+│ │ - Generate COLMAP rig.json               │    │
+│ │ Output: reframed/ + rig.json             │    │
+│ └──────────────────────────────────────────┘    │
+│            ↓                                    │
+│ ┌──────────────────────────────────────────┐    │
+│ │ MASKING (if needed)                      │    │
+│ │ - SAM3 segmentation with text prompts    │    │
+│ │ - Temporal consistency (for video)       │    │
+│ │ - Geometry-aware pole expansion          │    │
+│ │ Output: masked/ + quality report         │    │
+│ └──────────────────────────────────────────┘    │
+│            ↓                                    │
+│ Final: prepared/ (pinhole, clean, ready)        │
+└─────────────────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────────────────┐
+│ RECONSTRUCT (3 Sequential Stages)               │
+│                                                  │
+│ ┌──────────────────────────────────────────┐    │
+│ │ 1. EXTRACT: Feature Keypoints            │    │
+│ │ Input: prepared/ images                  │    │
+│ │ Output: features.h5                      │    │
+│ │ (keypoints, descriptors, confidence)     │    │
+│ └──────────────────────────────────────────┘    │
+│            ↓                                    │
+│ ┌──────────────────────────────────────────┐    │
+│ │ 2. RETRIEVE: Pair Selection (Parallel)   │    │
+│ │ Input: prepared/ images                  │    │
+│ │ Output: pairs.txt                        │    │
+│ │ (image pair candidates for matching)     │    │
+│ └──────────────────────────────────────────┘    │
+│            ↓                                    │
+│ ┌──────────────────────────────────────────┐    │
+│ │ 3a. MATCH: Feature Correspondence        │    │
+│ │ Input: features.h5 + pairs.txt           │    │
+│ │ Stage 1: LightGlue (fast, all pairs)     │    │
+│ │ Stage 2: MASt3R (fallback, weak pairs)   │    │
+│ │ Output: matches.h5                       │    │
+│ └──────────────────────────────────────────┘    │
+│            ↓                                    │
+│ ┌──────────────────────────────────────────┐    │
+│ │ 3b. SFM: Structure from Motion           │    │
+│ │ Input: images + features.h5 + matches.h5 │    │
+│ │ Backend: GLOMAP (global) or COLMAP       │    │
+│ │ Output: sparse/0/                        │    │
+│ │ (cameras.bin, images.bin, points3D.bin)  │    │
+│ └──────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────────────────┐
+│ OUTPUT (Conditional: In-Pipeline Training)      │
+│ - Gaussian splatting (gsplat/Nerfstudio)        │
+│ - Mesh extraction (GOF/PGSR/SuGaR)              │
+│ - Format export (PLY/OBJ/GLB/USDZ)              │
+└─────────────────────────────────────────────────┘
 ```
 
-### Module Dependencies
+### 2.2 Key Design Decisions
 
-**Core (Always Required):**
-- Extract → Match → SfM
+**Staged Retrieval (Not All-Pairs Matching)**
+- Sequential: O(k×n) pairs for video (temporal neighbors)
+- NetVLAD: O(k×n) pairs for general scenes (nearest neighbors from global descriptors)
+- Exhaustive: O(n²) pairs for small datasets (<1000 images)
+- Hybrid: Sequential + NetVLAD for video with geometric gaps
+- **Why:** 6900 images × exhaustive = 23.8M pairs. With NetVLAD (k=50): 345K pairs = 60x speedup.
 
-**Optional Preprocessing:**
-- Ingest (if starting from video)
-- Reframe (if 360° footage)
-- Masking (if removing objects)
+**Two-Phase Matching (LightGlue + MASt3R Fallback)**
+- LightGlue: ~35-40ms/pair, handles 95% of correspondences
+- MASt3R: ~300ms/pair (dense 3D-aware), retries pairs with <15 matches
+- **Why:** Dense matching on all pairs is prohibitively slow. Selective fallback captures difficult correspondences without destroying runtime.
 
-**Optional Postprocessing:**
-- Splat/Mesh/Export (if training in-pipeline instead of external tools)
+**Quality Gates & Manifests**
+- JSON manifest at each stage with configuration, metrics, quality flags
+- Enables resume from any failed stage
+- Provides audit trail for reconstruction quality debugging
+
+**Camera Model Auto-Detection**
+- SIMPLE_RADIAL: Generic cameras (default)
+- OPENCV: Distorted sensors (DJI Mavic, phone cameras)
+- PINHOLE: Reframed 360° (no distortion after projection)
+- Custom intrinsics from preset/EXIF
+
+### 2.3 File Structure
+
+```
+project_root/
+├── config.yaml                    # Pipeline configuration
+├── state.json                     # Resume state for interrupted runs
+│
+├── source/                        # INPUT
+│   ├── input_video.mp4           # or image folder
+│   └── ...
+│
+├── frames/                        # INGEST OUTPUT
+│   ├── frame_000001.jpg
+│   └── manifest.json
+│
+├── reframed/                      # REFRAME OUTPUT (360° only)
+│   ├── rig_views/
+│   │   ├── cam_00_000001.jpg     # Rig view 1, frame 1
+│   │   ├── cam_01_000001.jpg     # Rig view 2, frame 1
+│   │   └── ...
+│   ├── rig.json                  # COLMAP rig definition
+│   └── manifest.json
+│
+├── masked/                        # MASKING OUTPUT (if used)
+│   ├── masks/                    # Binary masks for inspection
+│   ├── masked_images/            # Images with masks applied
+│   └── manifest.json
+│
+├── prepared/                      # RECONSTRUCT INPUT
+│   ├── symlink to frames/reframed/masked
+│   └── manifest.json
+│
+├── features/                      # EXTRACT OUTPUT
+│   ├── feats-aliked-n8000.h5     # Keypoints + descriptors
+│   └── manifest.json
+│
+├── pairs/                         # RETRIEVE OUTPUT
+│   ├── pairs.txt                 # Space-separated image pairs
+│   └── manifest.json
+│
+├── matches/                       # MATCH OUTPUT
+│   ├── matches.h5                # Feature correspondences
+│   └── manifest.json
+│
+├── sparse/                        # SFM OUTPUT
+│   ├── 0/
+│   │   ├── cameras.bin           # Camera parameters
+│   │   ├── images.bin            # Poses + visibility
+│   │   ├── points3D.bin          # 3D points + descriptors
+│   │   └── project.ini
+│   └── manifest.json
+│
+└── output/                        # OPTIONAL: In-pipeline training
+    ├── splat/trained.ply
+    ├── mesh/model.obj
+    └── export/model.glb
+```
 
 ---
 
 ## 3. Module Reference
 
-### 3.1 Ingest Module
+### 3.1 INGEST Module
 
-**Purpose:** Extract frames from video with quality filtering and metadata extraction.
+**Purpose:** Detect source type and extract frames with quality filtering.
 
 **When to Use:**
-- ✅ Starting from video files
-- ❌ Already have extracted images
+- Starting from video (MP4, MOV, MKV)
+- Starting from OSV container (DJI drones)
+- Need auto-detection of camera profiles
 
-**What It Does:**
-- Extracts frames via ffmpeg/OpenCV
-- Reads EXIF (camera model, GPS, focal length)
-- Auto-detects camera profiles (DJI, GoPro, Insta360)
-- Filters low-quality frames (blur, exposure)
+**Not needed if:** Frames already extracted and organized in folders.
 
-**CLI Example:**
-```bash
-python -m modular_pipeline.ingest.extract \
-  input_video.mp4 \
-  ./output \
-  --fps 2 \
-  --quality-check
+#### Configuration
+
+```python
+# Source handling
+source_type: str = "auto"              # auto, video, images, osv
+skip_frames: int = 0                   # Skip first N frames
+max_frames: int = None                 # Limit total frames
+target_fps: float = None               # Resample video to target FPS
+
+# Quality filtering
+blur_threshold: float = 100.0          # Laplacian-based blur detection
+exposure_range: Tuple = (0.1, 0.9)     # Acceptable histogram bounds
+min_quality_score: float = 0.5         # 0-1, discard if below
+filter_quality: bool = True            # Enable quality filtering
+
+# Output
+output_format: str = "jpg"
+output_quality: int = 95               # JPEG quality
+rename_pattern: str = "frame_{:06d}.jpg"
 ```
 
-**Outputs:**
-- `frames/`: Extracted images (JPEG @ 95%)
-- `metadata.json`: EXIF + camera info
-- `quality_report.json`: Per-frame quality scores
+#### Backends
 
-**Defaults:**
-- FPS: 2
-- Quality threshold: 0.7 (discard blurry frames)
+| Backend | Use When |
+|---------|----------|
+| `ffmpeg` (recommended) | Large video files, variable frame rates |
+| `OpenCV` | Compatibility, smaller files |
+| `OSV Extractor` | DJI Mavic/Mini drones (native `.osv`) |
+
+#### Quality Filtering Explained
+
+**Blur Detection:** Laplacian variance over image. High variance = sharp. Threshold of 100 is conservative.
+- `blur_threshold` too high → keeps blurry frames → noisy features in reconstruct
+- `blur_threshold` too low → discards good frames → fewer matches
+
+**Exposure Filtering:** Histogram-based. Detects over/under-exposed frames.
+- `exposure_range = (0.1, 0.9)` means pixels must occupy bins 10%-90% of histogram
+- Adjusts for HDR video or scenes with heavy shadows
+
+**Quality Score:** Combined metric (blur + exposure + contrast).
+- `min_quality_score = 0.5` keeps ~70% of frames (typical)
+- `= 0.7` keeps ~50% (aggressive, for marginal footage)
+- `= 0.3` keeps ~90% (permissive, quality-agnostic)
+
+#### Example: Extract 360° video at specific FPS
+
+```bash
+python -m modular_pipeline.ingest.extract \
+  input_osmo.mov \
+  ./output \
+  --source-type osv \
+  --target-fps 2 \
+  --filter-quality \
+  --min-quality-score 0.6
+```
 
 ---
 
-### 3.2 Prepare Module
+### 3.2 REFRAME Module (360° → Pinhole)
 
-#### 3.2a. Reframe (360° → Pinhole)
-
-**Purpose:** Convert equirectangular projection to pinhole camera rig.
+**Purpose:** Project equirectangular imagery to pinhole camera rig.
 
 **When to Use:**
-- ✅ 360° footage (DJI Osmo, Insta360, GoPro MAX)
-- ❌ Standard camera footage
+- Insta360 One X2/X3/RS, DJI Osmo Action 4, GoPro MAX (native equirectangular output)
+- Need COLMAP-compatible pinhole geometry
 
-**Why This Matters:**
-Equirectangular has extreme distortion at poles. Standard feature detectors fail. Reframing creates 6-20 virtual pinhole views that COLMAP can reconstruct.
+**Critical:** Standard SfM assumes pinhole cameras. Equirectangular distortion (especially at poles) breaks feature matching. Reframing solves this.
 
-**CLI Example:**
+#### Why This Matters
+
+Equirectangular projection has extreme distortion:
+- Poles: 1° of latitude = tiny pixel area (features compressed)
+- Equator: 1° of latitude = normal pixel area
+- Feature detectors assume roughly uniform scale across image
+
+Reframing to pinhole rig (6-20 views) creates:
+- Uniform per-view distortion (handles with camera model)
+- Temporal consistency (each 3D point appears in multiple pinhole views)
+- COLMAP rig support (matches across views, solves joint bundle adjustment)
+
+#### Configuration
+
+```python
+class RigPattern(Enum):
+    CUBE_6 = "cube_6"              # 6 views, minimal coverage
+    RING_8 = "ring_8"              # 8 views, balanced
+    RING_12 = "ring_12"            # 12 views (RECOMMENDED)
+    GEODESIC_20 = "geodesic_20"    # 20 views, full coverage
+    ADAPTIVE = "adaptive"           # Content-aware rig
+
+# Configuration
+pattern: str = "ring_12"
+fov_h: float = 90                   # Horizontal FOV (degrees)
+fov_v: float = 60                   # Vertical FOV (degrees)
+overlap_target: float = 0.30        # Desired overlap between views
+output_resolution: Tuple = (1920, 1080)
+```
+
+#### Rig Pattern Tradeoffs
+
+| Pattern | Views | Overlap | Use When |
+|---------|-------|---------|----------|
+| `cube_6` | 6 | ~20% | Texture-rich scenes, speed priority |
+| `ring_8` | 8 | ~25% | Balanced quality/speed (most common) |
+| `ring_12` | 12 | ~35% | **Recommended**: feature-rich scenes |
+| `geodesic_20` | 20 | ~50% | Difficult lighting, sparse features |
+
+**Tradeoffs:**
+- More views → better coverage → more 3D points → slower matching (quadratic in pair count)
+- Fewer views → faster matching → potential registration gaps
+
+**Recommendation:** Start with `ring_12`. Increase to `geodesic_20` if registration < 80%.
+
+#### Projection Backends
+
+| Backend | Speed | Accuracy | Use When |
+|---------|-------|----------|----------|
+| PyTorch GPU | 10-50 ms/image | Best | GPU available |
+| NumPy (py360) | 100-500 ms | Good | CPU-only, Python-native |
+| equilib | 200-1000 ms | Good | CUDA unavailable |
+| OpenCV remap | 500-2000 ms | Good | Compatibility |
+| NumPy direct | >2000 ms | Best (transparent) | Debugging |
+
+#### Example: Reframe 360° video with adaptive rig
+
 ```bash
 python -m modular_pipeline.prepare.reframe \
   ./frames \
   ./output \
-  --pattern ring12 \
-  --fov 90
+  --pattern ring_12 \
+  --fov-h 90 \
+  --fov-v 60 \
+  --output-resolution 1920 1080
 ```
 
-**Rig Patterns:**
-- `cube`: 6 views (fast)
-- `ring8`: 8 views (balanced)
-- `ring12`: 12 views (recommended)
-- `geodesic`: 20+ views (maximum coverage)
+Output produces `rig.json`:
+```json
+{
+  "model_type": "OPENCV",
+  "cameras": [
+    {
+      "camera_id": 0,
+      "model": "OPENCV",
+      "width": 1920,
+      "height": 1080,
+      "params": [f_x, f_y, c_x, c_y, k1, k2, p1, p2, k3, k4, k5, k6]
+    },
+    ...
+  ],
+  "rig_cameras": [
+    {
+      "camera_id": 0,
+      "image_prefix": "cam_00_",
+      "t_i": [0, 0, 0],
+      "q_i": [1, 0, 0, 0]
+    },
+    ...
+  ]
+}
+```
 
-**Outputs:**
-- `rig_views/`: Pinhole projections
-- `rig.json`: COLMAP rig configuration
+COLMAP loads this and optimizes jointly across rig members.
 
 ---
 
-#### 3.2b. Masking
+### 3.3 MASKING Module (Object Removal)
 
-**Purpose:** Remove dynamic objects (people, vehicles, tripods) before feature extraction.
+**Purpose:** Remove dynamic objects (people, vehicles, tripods) using SAM3 segmentation.
 
 **When to Use:**
-- ✅ Scenes with moving people/cars
-- ✅ Tripod/selfie stick visible in 360° footage
-- ❌ Clean outdoor scenes
+- 360° footage with visible selfie stick/tripod
+- Urban scenes with people/vehicles
+- Need clean scene for feature matching
 
-**CLI Example:**
+**Not needed if:** Scene is static and background-only.
+
+#### Why This Matters
+
+Masking improves reconstruction by:
+- **Removing false features** on moving objects (unstable across frames)
+- **Stabilizing matcher** (fewer outliers from dynamic content)
+- **Cleaner SfM** (correct epipolar geometry, fewer ambiguous 3D points)
+
+Skipping masking when needed → high reprojection error, poor registration.
+
+#### Configuration
+
+```python
+class SegmentationModel(Enum):
+    SAM3 = "sam3"                   # Text prompts, RECOMMENDED
+    FASTSAM = "fastsam"             # YOLO-based, faster
+    EFFICIENTSAM = "efficient"      # TensorRT optimized
+    MOBILESAM = "mobile"            # Mobile GPU
+
+# Configuration
+model: str = "sam3"
+remove_prompts: List[str] = [
+    "person",
+    "tripod",
+    "camera operator",
+    "selfie stick",
+    "equipment"
+]
+keep_prompts: List[str] = []  # Keep specific regions
+confidence_threshold: float = 0.70
+review_threshold: float = 0.85       # Flag for manual review
+min_mask_area: int = 100
+max_mask_area_ratio: float = 0.5     # Don't remove >50% of image
+use_temporal_consistency: bool = True
+temporal_window: int = 5              # Frames for consistency
+geometry_aware: bool = True           # Expand masks for pole regions
+```
+
+#### Segmentation Model Tradeoffs
+
+| Model | Speed | Quality | Memory | Use When |
+|-------|-------|---------|--------|----------|
+| SAM3 | 300-500 ms | Excellent | 3GB+ | Text prompts needed, GPU available |
+| FastSAM | 50-100 ms | Good | 1GB | Speed priority, YOLOv8 trained |
+| EfficientSAM | 100-200 ms | Good | 500MB | Balanced, TensorRT available |
+| MobileSAM | 50-100 ms | Good | 200MB | Mobile/embedded GPU |
+
+#### Advanced: Temporal Consistency
+
+When `use_temporal_consistency=True`, masks are smoothed across video frames:
+- Frames t-2 to t+2 vote on mask at frame t
+- Prevents flickering masks (features appearing/disappearing)
+- **Cost:** +temporal_window × processing time
+- **Benefit:** Stable scene boundaries
+
+#### Advanced: Geometry-Aware Expansion
+
+For 360° footage with pole regions:
+- Pole masks are expanded by factor (default 1.2)
+- Prevents self-stick artifacts from bleeding into edge frames
+- Geometry-aware = uses image curvature to avoid over-expansion
+
+#### Example: Remove people from 360° footage with temporal smoothing
+
 ```bash
 python -m modular_pipeline.prepare.masking \
   ./frames \
   ./output \
-  --prompts "person,car,tripod" \
-  --model sam3
+  --model sam3 \
+  --remove-prompts "person" "tripod" "selfie stick" \
+  --confidence-threshold 0.7 \
+  --use-temporal-consistency \
+  --temporal-window 5 \
+  --geometry-aware
 ```
 
-**Models:**
-- `sam3`: Best quality (slow, GPU required)
-- `fastsam`: Fast (YOLOv8-based)  
-- `efficient_sam`: Balanced
-
-**Outputs:**
-- `masked/`: Masked images
-- `masks/`: Binary masks (for inspection)
+Output:
+```
+output/
+├── masked_images/              # Inpainted images
+├── masks/                       # Binary masks (for inspection)
+│   ├── frame_000001_mask.png
+│   └── ...
+└── manifest.json
+```
 
 ---
 
-### 3.3 Reconstruct Module (The Engine)
+### 3.4 EXTRACT Module (Feature Detection)
 
-**This is where customization happens.** The Reconstruct stage is three sequential operations:
+**Purpose:** Detect keypoints and compute descriptors for matching.
 
-#### 3.3a. Extract (Feature Detection)
+**When to Use:** Every reconstruction needs features. Primary variable: which extractor?
 
-**Purpose:** Detect keypoints and compute descriptors.
+#### Configuration
 
-**Customization Options:**
+```python
+class ExtractorBackend(Enum):
+    ALIKED = "aliked"               # RECOMMENDED (ECCV 2024)
+    XFEAT = "xfeat"                 # Fast real-time
+    SUPERPOINT = "superpoint"       # Legacy (still good)
+    DISK = "disk"                   # Dense, rotation-invariant
 
-| Parameter | Options | When to Use |
-|-----------|---------|-------------|
-| **Extractor** | `aliked` (default)<br>`superpoint`<br>`xfeat`<br>`disk` | aliked: Best quality (ECCV 2024)<br>superpoint: Fast baseline<br>xfeat: Experimental (CVPR 2024)<br>disk: Rotation-invariant |
-| **Keypoints** | 2000-20000 | 8000: Standard<br>16000: High-res images (>4K)<br>4096: Fast processing |
-| **Sub-pixel** | `True`/`False` | Enable for +2% accuracy (+7ms/image) |
-
-**CLI Example:**
-```bash
-python -m modular_pipeline.extract \
-  ./images \
-  ./output \
-  --extractor aliked \
-  --num-keypoints 8000 \
-  --subpixel-refinement  # Optional: +2% accuracy
+# Configuration
+extractor: str = "aliked"
+max_keypoints: int = 8000           # Per image
+nms_radius: int = 3                 # Non-maximum suppression
+keypoint_threshold: float = 0.005   # Detection confidence
+resize_max: int = 1600              # Max dimension (downscale for speed)
+subpixel_refinement: bool = False   # +2% accuracy, +7ms
 ```
 
-**Output:**
-- `features.h5`: Keypoints + descriptors (HDF5 format)
+#### Extractor Comparison & Tradeoffs
+
+| Extractor | Speed | Quality | Feature Type | When |
+|-----------|-------|---------|--------------|------|
+| **ALIKED** | 150-300ms | Excellent | Affine-invariant | **Default: best overall** |
+| **XFeat** | 50-100ms | Good | Fast inference | Need real-time processing |
+| **SuperPoint** | 200-400ms | Good | CNN (MagicLeap) | Legacy compatibility |
+| **DISK** | 100-200ms | Good | Dense, rotation-invariant | Homographic scenes |
+
+**Feature Type Implications:**
+
+- **Affine-invariant** (ALIKED): Handles scale, rotation, perspective. Best for general SfM.
+- **Rotation-invariant** (DISK): Good for tilted cameras, struggles with severe perspective.
+- **CNN-based** (SuperPoint): Learned from multi-scale data. Generalizes well.
+
+#### Parameter Tuning: max_keypoints
+
+**Effect across pipeline:**
+
+```
+max_keypoints: 4000
+├─ Extract: Fast (short descriptors)
+├─ Match: O(n²) pairs per image pair (16M operations)
+├─ SfM: Fewer 3D points, faster triangulation
+└─ Output: Sparser 3D point cloud
+
+max_keypoints: 8000 (DEFAULT)
+├─ Extract: 1.6x slower
+├─ Match: 4x more operations per pair
+├─ SfM: Dense correspondences, better registration
+└─ Output: Rich 3D cloud
+
+max_keypoints: 16000 (HIGH-RES)
+├─ Extract: 2.8x slower than default
+├─ Match: 8x more operations per pair (potential bottleneck)
+├─ SfM: Maximum detail, risk of overfitting
+└─ Output: Very dense cloud (diminishing returns)
+```
+
+**Decision Tree:**
+- `max_keypoints = 4000`: Low-texture scenes, speed critical, sparse features acceptable
+- `max_keypoints = 8000`: **Recommended default**
+- `max_keypoints = 16000`: High-res images (>4K), texture-rich scenes, small dataset (<1000 images)
+
+**Practical:** Increasing from 8K to 16K adds ~1 hour per 6900-image dataset, but only if bottleneck is at MATCH stage (depends on retrieval strategy).
+
+#### Parameter Tuning: nms_radius
+
+Non-maximum suppression. Spreads keypoint locations.
+
+- `nms_radius = 1`: Tight clustering, many features per region
+- `nms_radius = 3`: Default, balanced
+- `nms_radius = 5`: Sparse, high spatial diversity
+
+**When to change:** If features are clustered in texture-heavy regions (e.g., facade), increase to `nms_radius = 5`.
+
+#### Parameter Tuning: subpixel_refinement
+
+Refine keypoint locations to sub-pixel accuracy (ECCV 2024 enhancement).
+
+```
+subpixel_refinement = False (DEFAULT)
+├─ Extract: 150ms per image
+├─ Reprojection error: ~1.5px
+└─ Good enough for most scenes
+
+subpixel_refinement = True
+├─ Extract: +7ms per image (~5% overhead)
+├─ Reprojection error: ~0.8px (-50%)
+└─ Visible improvement only for high-precision scenes (close-range)
+```
+
+**When to enable:**
+- Close-range captures (architectural detail, small objects)
+- High-resolution output required
+- Bundle adjustment convergence is poor
 
 ---
 
-#### 3.3b. Match (Feature Correspondence)
+### 3.5 RETRIEVE Module (Pair Generation)
 
-**Purpose:** Find matching keypoints between image pairs.
+**Purpose:** Select image pairs for matching without exhaustive comparison.
 
-**Customization Options:**
+**When to Use:** Always runs in parallel with EXTRACT. Outcome: `pairs.txt`.
 
-| Parameter | Options | When to Use |
-|-----------|---------|-------------|
-| **Matcher** | `lightglue` (default)<br>`superglue`<br>`loftr` | lightglue: Best quality (ICCV 2023)<br>superglue: Good baseline<br>loftr: Dense matching |
-| **Retrieval** | `sequential`<br>`exhaustive`<br>`netvlad` | sequential: Video (temporal neighbors)<br>exhaustive: Small sets (<1000 images)<br>netvlad: **Large sets (6,900 images)** |
-| **Min Matches** | 15-50 | 20: Standard<br>15: Sparse scenes<br>30: Dense scenes |
+#### Configuration
 
-**Why Retrieval Matters:**
-- Without retrieval: 6,900 images = **23.8 million** pair comparisons (weeks of compute)
-- With NetVLAD: 6,900 images × 50 neighbors = **345,000** pairs (hours)
+```python
+class RetrievalBackend(Enum):
+    NETVLAD = "netvlad"             # RECOMMENDED (global descriptors)
+    SEQUENTIAL = "sequential"        # Video frame neighbors
+    VOCAB_TREE = "vocab_tree"       # COLMAP vocabulary
+    EXHAUSTIVE = "exhaustive"        # All pairs
+    HYBRID = "hybrid"                # Sequential + NetVLAD
 
-**CLI Example:**
+# Configuration
+retrieval: str = "netvlad"
+num_neighbors: int = 50              # K for k-NN
+```
+
+#### Retrieval Strategy Comparison
+
+| Strategy | Complexity | Use When |
+|----------|-----------|----------|
+| **Sequential** | O(k·n) | Video frames with temporal ordering |
+| **NetVLAD** | O(k·n) | Unordered images, large datasets |
+| **Vocabulary Tree** | O(k·n) | Revisit detection, loop closures |
+| **Hybrid** | O(2k·n) | Video with large temporal gaps |
+| **Exhaustive** | O(n²) | <1000 images only |
+
+**Pair Count Analysis:**
+
+```
+6,900 images:
+
+Exhaustive: n*(n-1)/2 = 23,790,450 pairs ← INFEASIBLE
+Sequential (k=20): 138,000 pairs (temporal neighbors)
+NetVLAD (k=50): 345,000 pairs ← RECOMMENDED
+Hybrid (k=20+50): 483,000 pairs (better coverage, still feasible)
+
+Time estimate (LightGlue @ 40ms/pair):
+Exhaustive: 264 hours
+Sequential: 1.5 hours
+NetVLAD: 3.8 hours ← PRACTICAL
+Hybrid: 5.3 hours
+```
+
+#### NetVLAD Details
+
+Uses ResNet50 global descriptors (trained on landmarks):
+- Each image → single 4096D vector
+- Compute k-nearest neighbors in descriptor space
+- Generate image pairs from k-NN results
+
+**Why it works:** Images with similar global appearance likely have features that match.
+
+**When it fails:** Scenes with large baseline changes (drone ascending), extreme lighting variation. Solution: increase `num_neighbors` to 100+.
+
+#### Hybrid Strategy
+
+For video with gaps (drone moving between locations):
+1. Sequential k-NN: temporal neighbors (handles continuous motion)
+2. NetVLAD k-NN: global neighbors (handles large temporal gaps, loop closures)
+3. Union: all pairs from both strategies
+
+**Cost:** 2× retrieval time, but captures both temporal continuity and spatial revisits.
+
+#### Example: Process 10,000 image dataset with NetVLAD + fallback
+
 ```bash
 python -m modular_pipeline.match \
   ./output/features.h5 \
   ./output \
+  --retrieval netvlad \
+  --num-neighbors 75 \
   --matcher lightglue \
-  --retrieval netvlad \  # CRITICAL for large datasets
-  --min-matches 20
+  --fallback-matcher mast3r \
+  --fallback-threshold 15
 ```
-
-**Outputs:**
-- `matches.h5`: Feature correspondences
-- `pairs.txt`: Image pairs matched
 
 ---
 
-#### 3.3c. SfM (Structure from Motion)
+### 3.6 MATCH Module (Feature Correspondence)
+
+**Purpose:** Find matching keypoints between image pairs.
+
+**Key decision:** Two-stage matching (fast + fallback).
+
+#### Configuration
+
+```python
+class MatcherBackend(Enum):
+    LIGHTGLUE = "lightglue"          # RECOMMENDED (sparse, fast)
+    MAST3R = "mast3r"                # Dense 3D-aware matching
+    ROMA = "roma"                    # Dense optical flow
+    SUPERGLUE = "superglue"          # Legacy
+
+# Configuration
+matcher: str = "lightglue"
+fallback_matcher: str = "mast3r"
+min_matches: int = 15
+fallback_threshold: int = 50         # Retry if < this many matches
+max_pairs_fallback: int = 500        # Max pairs to retry
+depth_confidence: float = -1         # -1 = quality, 0.9 = speed
+width_confidence: float = -1         # -1 = quality, 0.95 = speed
+```
+
+#### Matcher Comparison
+
+| Matcher | Speed | Density | Mode | When |
+|---------|-------|---------|------|------|
+| **LightGlue** | 35-40 ms | Sparse | ICCV 2023, transformer | **Default: best balance** |
+| **MASt3R** | 300-500 ms | Dense | 3D-aware, dense pred | Fallback for weak matches |
+| **RoMa** | 200-300 ms | Very Dense | Optical flow | Dense scenes |
+| **SuperGlue** | 100-150 ms | Sparse | CVPR 2020 | Legacy, slower than LightGlue |
+
+#### Two-Stage Matching Strategy
+
+**Stage 1: LightGlue (All Pairs)**
+```
+For each image pair in pairs.txt:
+├─ Load ALIKED descriptors
+├─ Run LightGlue correspondence
+├─ Record matches + confidence
+└─ Elapsed: ~40ms per pair
+```
+
+**Stage 2: MASt3R Fallback (Selective Retry)**
+```
+For pairs with < 15 matches in Stage 1:
+├─ Run MASt3R (dense matching)
+├─ Dense depth prediction + feature tracking
+├─ May find 50-300+ matches (depending on baseline)
+└─ Elapsed: ~400ms per pair (but only ~5% of pairs)
+```
+
+**Why two stages:**
+- LightGlue is 10x faster than dense matching
+- LightGlue handles 95% of pairs well
+- Dense matching (MASt3R) needed only for pairs with wide baseline or sparse texture
+- Overall: 3.8 hours (NetVLAD 345K pairs) vs. 50+ hours (dense only)
+
+#### Parameter Tuning: min_matches
+
+Minimum correspondences to accept a pair.
+
+```
+min_matches = 10
+├─ Permissive: includes weak pairs
+├─ SfM: more pairs to triangulate from
+├─ Risk: outliers from weak matches
+└─ Reprojection error may increase
+
+min_matches = 15 (DEFAULT)
+├─ Balanced: filters obvious false pairs
+├─ SfM: robust triangulation
+└─ Good for most scenes
+
+min_matches = 30
+├─ Aggressive: only strong correspondences
+├─ SfM: fewer but higher-quality 3D points
+└─ Risk: potential registration gaps if too strict
+```
+
+**Decision:** Start with default (15). Lower to 10 if registration < 50%. Increase to 30 only if SfM fails with too many outliers.
+
+#### Parameter Tuning: fallback_threshold & max_pairs_fallback
+
+```
+fallback_threshold = 50
+├─ LightGlue outputs < 50 matches?
+├─ Retry with MASt3R fallback
+└─ Cost: ~400ms per pair
+
+max_pairs_fallback = 500
+├─ Only retry up to 500 pairs
+├─ Prevents excessive fallback runtime
+└─ If >500 pairs fail, continues with LightGlue-only
+```
+
+**Tuning:**
+- `fallback_threshold = 20`: Aggressive fallback, more runtime but richer matching
+- `fallback_threshold = 50`: Balanced (default)
+- `fallback_threshold = 100`: Permissive LightGlue, rarely triggers fallback
+
+---
+
+### 3.7 SFM Module (Structure from Motion)
 
 **Purpose:** Reconstruct 3D structure and camera poses.
 
-**Customization Options:**
+**Primary variable:** Backend choice (speed vs. robustness).
 
-| Parameter | Options | When to Use |
-|-----------|---------|-------------|
-| **Backend** | `glomap` (default)<br>`colmap`<br>`instant` | glomap: 10-50x faster (global SfM)<br>colmap: More robust (incremental SfM)<br>instant: MASt3R fallback (experimental) |
-| **Camera Model** | `SIMPLE_RADIAL`<br>`OPENCV`<br>`PINHOLE` | SIMPLE_RADIAL: Generic cameras<br>OPENCV: DJI Mavic (distortion)<br>PINHOLE: Rectified 360° |
-| **Triangulation** | `tri_max_error`<br>`tri_min_angle` | max_error 4.0px: Standard<br>max_error 1.0px: Precision<br>min_angle 1.5°: Conservative |
+#### Configuration
 
-**Intrinsics (Advanced):**
-If you know your camera's sensor size and focal length, specify them for faster convergence:
 ```python
-SfMConfig(
-    focal_length_mm=24.0,     # Mavic 3 Pro
-    sensor_width_mm=17.3,     # 4/3" sensor
-    camera_model='OPENCV'
-)
+class MapperBackend(Enum):
+    GLOMAP = "glomap"               # RECOMMENDED (global SfM)
+    COLMAP = "colmap"               # Incremental SfM
+
+class CameraModel(Enum):
+    SIMPLE_RADIAL = "SIMPLE_RADIAL" # DEFAULT (generic)
+    OPENCV = "OPENCV"               # Distortion model (DJI)
+    PINHOLE = "PINHOLE"             # No distortion (reframed)
+
+# Configuration
+mapper: str = "glomap"
+camera_model: str = "SIMPLE_RADIAL"
+max_num_tracks: int = 6_000_000
+tri_min_angle: float = 1.5           # Triangulation angle (degrees)
+tri_max_error: float = 4.0           # Reprojection error (pixels)
+tri_max_dist: float = 100.0          # Max distance (meters)
+refine_intrinsics: bool = True       # Optimize focal length, principal point
 ```
 
-**CLI Example:**
+#### Mapper Backend Comparison
+
+| Backend | Speed | Robustness | Best For |
+|---------|-------|-----------|----------|
+| **GLOMAP** | 10-50x faster | 8% higher recall | Global scenes, large datasets |
+| **COLMAP** | Baseline (1x) | Robust, well-tested | Incremental scenes, small datasets |
+
+**GLOMAP (Global SfM):**
+1. Global rotations → camera directions
+2. Global translations → camera positions
+3. Bundle adjustment (optional)
+4. Point triangulation
+
+**Advantages:**
+- 10-50x faster (avoids incremental growing)
+- Better for unordered images (doesn't need initialization)
+- Higher recall (8% better registration)
+
+**Disadvantages:**
+- Requires good initial rotation estimates (from pairs)
+- Sensitive to outliers in early stages
+- Less field-tested than COLMAP
+
+**COLMAP (Incremental SfM):**
+1. Find connected component of image graph
+2. Pick two-view pair with most matches
+3. Incrementally add images, triangulate, bundle adjust
+4. Repeat for additional components
+
+**Advantages:**
+- More robust to outliers
+- Incremental BA catches early mistakes
+- Well-established, predictable
+
+**Disadvantages:**
+- 10-50x slower
+- Sensitive to initialization (two-view pair selection)
+- May fail on truly unordered datasets
+
+**Recommendation:** Start with GLOMAP for large datasets. Fall back to COLMAP if GLOMAP registration < 80%.
+
+#### Camera Model Selection
+
+| Model | Distortion Parameters | When |
+|-------|----------------------|------|
+| SIMPLE_RADIAL | f, cx, cy, k | Generic cameras, phones |
+| OPENCV | f, cx, cy, k1, k2, p1, p2, k3, k4, k5, k6 | DJI drones, strong distortion |
+| PINHOLE | f, cx, cy | Reframed 360° (no distortion) |
+| RADIAL | More parameters, slower | Over-parameterized, avoid |
+
+**SIMPLE_RADIAL vs OPENCV:**
+- SIMPLE_RADIAL: 4 parameters, fast convergence, generic
+- OPENCV: 12 parameters, captures complex distortion (DJI Mavic)
+
+**When OPENCV matters:**
+- DJI drones (Mavic 3 Pro has visible barrel distortion)
+- Phone cameras (strong pincushion)
+- Fisheye lenses
+
+**Decision:** Use SIMPLE_RADIAL unless you know camera has strong distortion. Can always try OPENCV in troubleshooting.
+
+#### Parameter Tuning: tri_max_error (Triangulation Reprojection Error)
+
+Reprojection error threshold for 3D point acceptance.
+
+```
+tri_max_error = 1.0 px
+├─ Very strict: only high-quality 3D points
+├─ Output: Fewer points, very clean
+└─ Risk: May reject valid points (under-triangulation)
+
+tri_max_error = 4.0 px (DEFAULT)
+├─ Balanced: accepts most valid triangulations
+├─ Output: Dense, well-registered points
+└─ Good for most scenes
+
+tri_max_error = 8.0 px
+├─ Permissive: includes marginal points
+├─ Output: Maximum density
+└─ Risk: Noisy 3D cloud, potential artifacts in rendering
+```
+
+**Practical guidance:**
+- Start with 4.0. If point cloud is too sparse → increase to 8.0. If too noisy → decrease to 2.0.
+- Reprojection error > 2px typically indicates poor alignment. Check camera model choice.
+
+#### Parameter Tuning: tri_min_angle
+
+Triangulation angle threshold (degrees).
+
+```
+tri_min_angle = 0.5°
+├─ Permissive: even near-parallel viewing rays accepted
+├─ Output: Dense points, but high depth uncertainty
+└─ Risk: Unstable triangulation (sensitive to noise)
+
+tri_min_angle = 1.5° (DEFAULT)
+├─ Balanced: typical baseline for SfM
+├─ Output: Stable 3D points
+└─ Good for most scenes
+
+tri_min_angle = 3.0°
+├─ Strict: only wide baseline pairs contribute
+├─ Output: Sparse but very robust
+└─ Use if output is too noisy
+```
+
+**Decision:** Default 1.5° is good. Only adjust if:
+- Sparse point cloud → lower to 0.5°
+- Noisy point cloud → increase to 3.0°
+
+#### Example: Reconstruct with GLOMAP + OPENCV camera model
+
 ```bash
 python -m modular_pipeline.sfm \
   ./output \
-  --backend glomap \
+  --mapper glomap \
+  --camera-model OPENCV \
   --refine-intrinsics \
-  --tri-max-error 4.0
+  --tri-max-error 4.0 \
+  --tri-min-angle 1.5
 ```
 
-**Outputs:**
-- `sparse/0/cameras.bin`: Camera intrinsics
-- `sparse/0/images.bin`: Camera poses
-- `sparse/0/points3D.bin`: 3D point cloud
+---
 
-**Quality Metrics:**
-- Registration rate: >90% is good
-- Mean reprojection error: <2.0px is good
-- Point count: More is better (depends on scene)
+## 4. Parameter Tuning Guide
+
+### Decision Tree: What to Change When
+
+```
+Registration rate < 50%?
+├─ Yes
+│  ├─ Try COLMAP instead of GLOMAP
+│  ├─ Try XFeat extractor (different feature type)
+│  ├─ Increase max_keypoints to 16000
+│  ├─ Check camera model (SIMPLE_RADIAL vs OPENCV)
+│  └─ Inspect image quality (blur, exposure)
+└─ No → OK, continue
+
+Registration 50-80%?
+├─ Increase max_keypoints from 8000 to 16000
+├─ Increase fallback_threshold from 50 to 75
+├─ Increase tri_max_error from 4.0 to 8.0
+└─ Try COLMAP for more robust incremental SfM
+
+Registration > 90% but point cloud sparse (<100K points)?
+├─ Increase max_keypoints to 16000
+├─ Decrease tri_max_error from 4.0 to 2.0
+├─ Decrease tri_min_angle from 1.5 to 0.5
+├─ Lower min_matches from 15 to 10
+└─ Enable subpixel_refinement
+
+Processing slow (>4 hours for 6900 images)?
+├─ Reduce max_keypoints to 4000
+├─ Use sequential retrieval if video (faster than NetVLAD)
+├─ Reduce num_neighbors from 50 to 30
+├─ Lower max_pairs_fallback from 500 to 100
+└─ Use GLOMAP (already selected by default)
+
+Reprojection error > 2.0 px?
+├─ Check camera_model (try OPENCV if using SIMPLE_RADIAL)
+├─ Enable subpixel_refinement
+├─ Lower tri_max_error to 2.0
+├─ Inspect for blurry/low-quality images
+└─ Check image alignment (are frames in correct order?)
+
+Point cloud has artifacts/speckles?
+├─ Increase tri_min_angle from 1.5 to 3.0
+├─ Increase tri_max_error threshold
+├─ Lower fallback_threshold (reject weak matches)
+└─ Try masking (if moving objects present)
+```
+
+### Cascading Effects of Common Changes
+
+**Scenario 1: "Need faster processing"**
+```
+Change: Reduce max_keypoints from 8000 to 4000
+Impact:
+├─ Extract: 50% faster ✓
+├─ Match: 75% fewer comparisons (O(n²) effect) ✓✓
+├─ SfM: Faster, but registration may drop
+└─ Output: Sparser 3D cloud
+
+Net: Save 1-2 hours, lose some detail. Good if time-critical.
+```
+
+**Scenario 2: "Need richer 3D points"**
+```
+Change: Increase max_keypoints from 8000 to 16000
+Impact:
+├─ Extract: 2.8x slower (1.5 hours for 6900 images)
+├─ Match: 4x more operations, potential bottleneck (could add 8 hours!)
+├─ SfM: More triangulation candidates, denser output
+└─ Output: 2-4x more 3D points
+
+Net: 8-10 hours additional compute, 2-4x density gain. Diminishing returns.
+```
+
+**Scenario 3: "Getting too many false matches"**
+```
+Change: Increase min_matches from 15 to 30, disable fallback
+Impact:
+├─ Match: Faster (skip fallback matcher), fewer weak pairs
+├─ SfM: Fewer pairs to triangulate from
+└─ Output: Cleaner but potentially sparser
+
+Net: Faster match stage, risk of registration gaps.
+```
+
+**Scenario 4: "Have 30,000 images, need to finish in 12 hours"**
+```
+Changes:
+├─ max_keypoints: 4000 (fast extraction)
+├─ retrieval: "sequential" if video, else NetVLAD with num_neighbors=30
+├─ min_matches: 15 (standard)
+├─ tri_max_error: 6.0 (permissive)
+└─ mapper: "glomap" (already default)
+
+Estimate: 3-4 hours vs. 12+ hours with defaults.
+Trade: Sparse features but feasible processing.
+```
 
 ---
 
-## 4. Installation
+## 5. Installation
 
-### Before You Start
+### Prerequisites
 
-**What you need:**
-- A computer with Python 3.10 installed
-- A terminal/command prompt (explained below)
-- Internet connection
+- Python 3.10+
+- CUDA 11.8+ (GPU recommended, CPU fallback available)
+- 32GB+ RAM (for large datasets; 16GB minimum)
 
-**Opening your terminal:**
-- **Windows:** Press `Win + R`, type `cmd`, press Enter
-- **Mac:** Press `Cmd + Space`, type `terminal`, press Enter  
-- **Linux:** Press `Ctrl + Alt + T`
+### Step 1: Clone and Set Up Environment
 
----
-
-### Step 1: Create a Python Environment
-
-**What this does:** Creates an isolated Python workspace so MRP doesn't interfere with other programs.
-
-**Copy and paste this into your terminal:**
 ```bash
+git clone <repo>
+cd modular-reconstruction-pipeline
+
 conda create -n mrp python=3.10
-```
-
-Press Enter. Type `y` when asked to proceed.
-
-**Activate it:**
-```bash
 conda activate mrp
-```
 
-You should see `(mrp)` appear at the start of your terminal line. This means you're "inside" the environment.
-
----
-
-### Step 2: Install Core Packages
-
-**What this does:** Downloads the essential Python libraries MRP needs to run.
-
-```bash
-pip install numpy opencv-python torch torchvision h5py pyyaml tqdm pillow piexif lightglue
-```
-
-This will take 2-5 minutes. You'll see progress bars.
-
----
-
-### Step 3: Install SfM Tools
-
-**What this does:** Installs GLOMAP/COLMAP for building 3D reconstructions.
-
-```bash
-git clone --recursive https://github.com/cvg/Hierarchical-Localization/
-cd Hierarchical-Localization
 pip install -e .
-cd ..
 ```
 
-**What each line means:**
-- Line 1: Downloads the HLOC code from GitHub
-- Line 2: Moves into that folder (think: opening a subfolder)
-- Line 3: Installs it  
-- Line 4: Moves back to your original folder
+### Step 2: Install Optional Dependencies
 
----
-
-### Step 4 (Optional): Video Support
-
-**Only needed if you're starting from video files** (skip if you have images).
-
-**Linux/Mac:**
+**For video support:**
 ```bash
+# Ubuntu/Debian
 sudo apt install ffmpeg
+
+# macOS
+brew install ffmpeg
+
+# Windows: Download from ffmpeg.org
 ```
 
-**Windows:**  
-Download from [ffmpeg.org](https://ffmpeg.org/download.html) and follow their install guide.
-
----
-
-### Step 5 (Optional): 360° Camera Support
-
-**Only needed for Osmo 360, Insta360, GoPro MAX** (skip for drones/DSLRs).
-
-Nothing to install! MRP uses the built-in `reframe_v2.py` module.
-
----
-
-## 5. Quick Start
-
-### Absolute Beginner? Start Here
-
-**Goal:** Turn your drone photos into a COLMAP reconstruction in one command.
-
-#### Step 1: Prepare Your Folder
-
-**Create this structure on your computer:**
-
-```
-my_project/
-└── source/
-    ├── IMG_0001.jpg
-    ├── IMG_0002.jpg
-    └── ... (rest of your images)
-```
-
-**How:**
-1. Create a folder named `my_project` (anywhere you want)
-2. Inside it, create a subfolder named `source`
-3. Copy all your drone photos into `source/`
-
----
-
-#### Step 2: Open Terminal in the Right Place
-
-**You need to "be" in the parent folder** (the one containing `my_project`).
-
-**How to get there:**
-
-**Windows:**
-1. Open File Explorer
-2. Navigate to the folder containing `my_project`
-3. Hold `Shift`, right-click empty space
-4. Click "Open PowerShell window here"
-
-**Mac/Linux:**
-1. Open your file manager
-2. Navigate to the folder containing `my_project`
-3. Right-click → "Open Terminal here" (or drag folder to Terminal icon)
-
-**Check you're in the right place:**
+**For GPU acceleration (PyTorch with CUDA):**
 ```bash
-ls
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 ```
-(Mac/Linux) or
-```bash
-dir
-```
-(Windows)
 
-You should see `my_project` listed.
+**For additional matchers (RoMa, MASt3R):**
+```bash
+pip install roma mast3r  # Optional
+```
 
 ---
 
-#### Step 3: Run the Automatic Pipeline
+## 6. Usage
 
-**For DJI Mavic 3 Pro:**
+### Basic Pipeline (All Stages)
+
 ```bash
 python -m modular_pipeline.pipeline ./my_project --preset mavic_3_pro
 ```
 
-**For DJI Mavic Air 2S:**
-```bash
-python -m modular_pipeline.pipeline ./my_project --preset mavic_air_2s
-```
-
-**For generic drone (if your model isn't listed):**
-```bash
-python -m modular_pipeline.pipeline ./my_project --preset drone
-```
-
-**What this command means:**
-- `python -m modular_pipeline.pipeline`: "Hey Python, run the MRP pipeline program"
-- `./my_project`: "Process the stuff in the folder called `my_project` right here"
-- `--preset mavic_3_pro`: "Use the Mavic 3 Pro settings"
-
----
-
-#### Step 4: Wait
-
-Processing time depends on image count:
-- **1,000 images:** ~45 minutes
-- **6,900 images:** ~3 hours  
-- **10,000+ images:** 4-6 hours
-
-The terminal will show progress. Don't interrupt it.
-
----
-
-#### Step 5: Get Your Result
-
-When finished, you'll have:
-
-```
-my_project/
-├── source/           # Your original images
-├── sparse/
-│   └── 0/
-│       ├── cameras.bin   ← Load this into PostShot
-│       ├── images.bin
-│       └── points3D.bin
-└── ... (other folders)
-```
-
-**To use in PostShot:**
-1. Open PostShot
-2. Import → COLMAP Project
-3. Navigate to `my_project/sparse/0/`
-4. Select all three `.bin` files
-5. Train!
-
----
-
-### 360° Camera? (Osmo, Insta360, GoPro MAX)
-
-**Different workflow** because 360° needs reframing first.
-
-#### Your Folder Setup:
-
-```
-my_360_project/
-└── source/
-    └── my_video.mp4   (or equirectangular images)
-```
-
-#### Run This:
+### Stage-by-Stage (Manual Control)
 
 ```bash
-python -m modular_pipeline.pipeline ./my_360_project --preset osmo_360
+# Stage 1: Extract features
+python -m modular_pipeline.extract \
+  ./my_project/frames \
+  ./my_project/output \
+  --extractor aliked \
+  --max-keypoints 8000
+
+# Stage 2: Retrieve pairs (runs in parallel, but can be explicit)
+python -m modular_pipeline.retrieve \
+  ./my_project/frames \
+  ./my_project/output \
+  --retrieval netvlad \
+  --num-neighbors 50
+
+# Stage 3: Match features
+python -m modular_pipeline.match \
+  ./my_project/output/features.h5 \
+  ./my_project/output \
+  --matcher lightglue \
+  --fallback-matcher mast3r
+
+# Stage 4: Reconstruct
+python -m modular_pipeline.sfm \
+  ./my_project/output \
+  --mapper glomap \
+  --camera-model OPENCV
 ```
 
-The preset automatically:
-1. Extracts frames from video
-2. Reframes equirectangular → 12 pinhole views
-3. Removes tripod/selfie stick
-4. Runs reconstruction
+### Module-Only Use Cases
 
-Result in `my_360_project/sparse/0/` (same as above).
-
----
-
-### Advanced: Manual Control (Skip if Automated Works)
-
-**Only needed if:**
-- The preset fails
-- You need custom settings
-- You're debugging
-
-See [Module Reference](#3-module-reference) for detailed control over Extract, Match, and SfM stages.
-
-**Example (manual 3-step process):**
-
+**Just masking:**
 ```bash
-# Step 1: Extract features
-python -m modular_pipeline.extract ./my_project/source ./my_project/output
-
-# Step 2: Match features
-python -m modular_pipeline.match ./my_project/output/features.h5 ./my_project/output --retrieval netvlad
-
-# Step 3: Reconstruct
-python -m modular_pipeline.sfm ./my_project/output --backend glomap
+python -m modular_pipeline.prepare.masking \
+  ./frames \
+  ./output \
+  --model sam3 \
+  --remove-prompts "person,tripod"
 ```
 
-**What `./` means:** "Right here in this folder." So `./my_project` means "the `my_project` folder in my current location."
-
----
-
-## 6. Configuration
-
-### Default Settings
-
-```python
-# Extract
-ExtractConfig(
-    extractor="aliked",
-    num_keypoints=8000,
-    subpixel_refinement=False,
-    device="auto"
-)
-
-# Match
-MatchConfig(
-    matcher="lightglue",
-    retrieval="sequential",
-    min_matches=20
-)
-
-# SfM
-SfMConfig(
-    backend="glomap",
-    refine_intrinsics=True,
-    tri_min_angle=1.5,
-    tri_max_error=4.0
-)
-```
-
-### When to Override
-
-**High-resolution images (>4K):**
+**Just reframing (360° to pinhole):**
 ```bash
---num-keypoints 16000
+python -m modular_pipeline.prepare.reframe \
+  ./frames \
+  ./output \
+  --pattern ring_12 \
+  --fov-h 90
 ```
 
-**Maximum quality:**
+**Resume from checkpoint:**
 ```bash
---subpixel-refinement  # Extract
---backend colmap       # SfM (10-50x slower)
-```
-
-**Large unordered datasets:**
-```bash
---retrieval netvlad  # Match
-```
-
-**Difficult scenes (low texture):**
-```bash
---min-matches 15
---tri-max-error 8.0
+# If pipeline failed at SfM stage, fix and re-run:
+python -m modular_pipeline.pipeline ./my_project --resume
 ```
 
 ---
 
-## 7. Output Formats
+## 7. Quality Assessment
 
-### COLMAP Directory Structure
+### Metrics at Each Stage
 
+#### Ingest Quality
+```json
+{
+  "total_frames": 6234,
+  "filtered": 312,
+  "quality": {
+    "excellent": 5890,
+    "good": 322,
+    "review": 20,
+    "poor": 2
+  }
+}
 ```
-output/
-├── images/              # Input images (or symlink)
-├── sparse/
-│   └── 0/
-│       ├── cameras.bin  # Camera intrinsics
-│       ├── images.bin   # Camera poses
-│       └── points3D.bin # 3D point cloud
-├── features.h5          # Keypoints + descriptors
-├── matches.h5           # Feature correspondences
-└── metadata.json        # EXIF (if using Ingest)
+**Action:** Inspect "poor" frames for corruption.
+
+#### Extract Quality
+```json
+{
+  "avg_keypoints_per_image": 8120,
+  "min_keypoints": 324,
+  "max_keypoints": 9840
+}
+```
+**Action:** If min < 1000, check for low-texture images.
+
+#### Match Quality
+```json
+{
+  "total_pairs": 345000,
+  "pairs_with_matches": 312450,
+  "success_rate": 0.905,
+  "fallback_pairs": 18234
+}
+```
+**Action:** If success_rate < 0.80, increase num_neighbors or max_keypoints.
+
+#### SFM Quality
+```json
+{
+  "total_images": 6234,
+  "registered_images": 5989,
+  "registration_rate": 0.961,
+  "total_3d_points": 3456789,
+  "mean_track_length": 2.8,
+  "mean_reprojection_error": 1.23
+}
 ```
 
-### Loading into External Tools
+**Good indicators:**
+- Registration rate > 90%
+- Mean reprojection error < 2.0 px
+- Mean track length > 2.0
 
-**PostShot:**
-1. Import → COLMAP Project
-2. Select `output/sparse/0/`
-3. Point to images directory
-4. Begin training
-
-**Lichtfeld Studio:**
-1. File → Import → COLMAP
-2. Navigate to `output/sparse/0/`
-3. Configure training
-
-**Nerfstudio:**
-```bash
-ns-train splatfacto \
-  --data output \
-  colmap \
-  --colmap-model-path output/sparse/0
-```
+**Warning signs:**
+- Registration rate < 50% → check extractor, camera model
+- Reprojection error > 3.0 px → check image blur, camera calibration
+- Track length < 1.5 → too few matches, increase max_keypoints
 
 ---
 
 ## 8. Troubleshooting
 
-### Low Registration Rate (<50%)
+### Registration Rate < 50%
 
-**Symptoms:** GLOMAP/COLMAP registers <50% of images
+**Root causes:**
+1. Poor image quality (blur, motion, dark)
+2. Wrong camera model
+3. Weak feature extraction
+4. Insufficient matches
 
-**Solutions:**
-1. Try COLMAP: `--backend colmap`
-2. Check image quality: `python -m modular_pipeline.ingest.quality ./images`
-3. Increase keypoints: `--num-keypoints 16000`
-4. Enable sub-pixel: `--subpixel-refinement`
+**Solutions (in order):**
+```bash
+# 1. Try COLMAP (more robust initialization)
+python -m modular_pipeline.sfm ./output --mapper colmap
 
----
+# 2. Increase feature density
+python -m modular_pipeline.extract ./images ./output --max-keypoints 16000
 
-### Sparse Point Cloud
+# 3. Try different extractor
+python -m modular_pipeline.extract ./images ./output --extractor xfeat
 
-**Symptoms:** <10,000 3D points
+# 4. Inspect image quality
+python -m modular_pipeline.ingest.quality ./images
 
-**Solutions:**
-1. Increase keypoints: `--num-keypoints 16000`
-2. Lower match threshold: `--min-matches 15`
-3. Relax triangulation: `--tri-max-error 8.0`
+# 5. Try OPENCV camera model
+python -m modular_pipeline.sfm ./output --camera-model OPENCV --refine-intrinsics
+```
 
----
+### Sparse Point Cloud (<100K Points)
 
-### High Reprojection Error
+```bash
+# Increase features
+--max-keypoints 16000
 
-**Symptoms:** Mean error >2.0px
+# Lower triangulation thresholds
+--tri-max-error 8.0 --tri-min-angle 0.5
 
-**Solutions:**
-1. Enable sub-pixel refinement (Extract)
-2. Use COLMAP instead of GLOMAP
-3. Check for motion blur/camera shake
+# Reduce match threshold
+--min-matches 10
+```
 
----
+### High Reprojection Error (>2.0 px)
+
+```bash
+# Enable sub-pixel refinement
+--subpixel-refinement
+
+# Try COLMAP backend
+--mapper colmap
+
+# Check camera model
+--camera-model OPENCV
+```
 
 ### 360° Reconstruction Fails
 
-**Symptoms:** Poor results with equirectangular footage
-
-**Solutions:**
-1. **Use reframe module:** `--pattern ring12`
-2. Verify `rig.json` exists in output
-3. Check FOV is correct (usually 90°)
-
----
-
-### Too Many Images for Exhaustive Matching
-
-**Symptoms:** >1M pair warning
-
-**Solution:**
 ```bash
---retrieval netvlad  # Or sequential for video
+# Verify reframing output
+ls output/reframed/rig_views/  # Should have cam_00, cam_01, etc.
+
+# Increase rig views
+--pattern geodesic_20
+
+# Check rig.json exists
+cat output/reframed/rig.json
 ```
 
----
+### Processing Too Slow
 
-## Performance Benchmarks
+```bash
+# Reduce keypoints
+--max-keypoints 4000
 
-**Test System:** RTX 3090 Ti, 6,900 drone images
+# Sequential if video
+--retrieval sequential
 
-| Stage | Time | Notes |
-|-------|------|-------|
-| Extract (ALIKED) | ~45 min | 8000 keypoints/image |
-| Match (NetVLAD) | ~2 hours | 345K pairs |
-| SfM (GLOMAP) | ~15 min | Global reconstruction |
-| **Total** | **~3 hours** | Ready for PostShot |
+# Fewer neighbors
+--num-neighbors 30
 
-**Comparisons:**
-- COLMAP (vs GLOMAP): +4-8 hours
-- Exhaustive matching (vs NetVLAD): +8-12 hours
-- SuperPoint (vs ALIKED): Faster but lower quality
+# Skip fallback
+--max-pairs-fallback 0
+```
 
 ---
 
 ## References
 
 **Papers:**
-- ALIKED (ECCV 2024) - Feature extraction
-- LightGlue (ICCV 2023) - Feature matching
-- GLOMAP (2024) - Global SfM
-- SAM3 (2024) - Segmentation
+- ALIKED (ECCV 2024): https://github.com/Shiaoming/ALIKED
+- LightGlue (ICCV 2023): https://github.com/cvg/LightGlue
+- GLOMAP (2024): https://github.com/cvg/GLOMAP
+- SAM3 (2024): https://github.com/facebookresearch/sam2
+- MASt3R (2024): https://github.com/naver/mast3r
 
-**Tools:**
-- [COLMAP](https://colmap.github.io/)
-- [HLOC](https://github.com/cvg/Hierarchical-Localization)
-- [PostShot](https://www.postshot.app/)
-- [Lichtfeld Studio](https://lichtfeld-studio.com/)
+**Toolkits:**
+- HLOC (Hierarchical Localization): https://github.com/cvg/Hierarchical-Localization
+- COLMAP: https://colmap.github.io/
+- OpenCV: https://opencv.org/
+
+**External Tools:**
+- PostShot: https://www.postshot.app/
+- Nerfstudio: https://docs.nerf.studio/
+- Lichtfeld Studio: https://lichtfeld-studio.com/
