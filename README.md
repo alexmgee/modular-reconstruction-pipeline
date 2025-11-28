@@ -405,44 +405,425 @@ Single module only?
 
 ---
 
-## Parameter Tuning: Decision Tree
+## Parameter Tuning: Expert Decision Tree
+
+### 1. REGISTRATION RATE
 
 ```
-Registration < 50%?
-├─ Try --mapper colmap (more robust)
-├─ Try --max-keypoints 16000
-├─ Try --extractor xfeat (different features)
-├─ Check --camera-model OPENCV
-└─ Inspect image quality (blur, exposure)
+Registration Rate?
+├─ < 30% (BROKEN)
+│  ├─ Step 1: Try COLMAP (more robust than GLOMAP)
+│  │  └─ Still broken? → Check image quality
+│  ├─ Step 2: Increase feature count
+│  │  ├─ --max-keypoints 16000
+│  │  ├─ --subpixel-refinement
+│  │  └─ --keypoint-threshold 0.001 (aggressive detection)
+│  ├─ Step 3: Try different extractor
+│  │  ├─ aliked → xfeat (different feature type, worth trying)
+│  │  └─ aliked → superpoint (more conservative)
+│  ├─ Step 4: Check camera model
+│  │  ├─ If DJI/phone → --camera-model OPENCV
+│  │  ├─ If 360° reframed → --camera-model PINHOLE
+│  │  └─ Always → --refine-intrinsics
+│  ├─ Step 5: Relax match constraints
+│  │  ├─ --min-matches 10 (down from 15)
+│  │  ├─ --fallback-threshold 30 (retry sooner)
+│  │  └─ --max-pairs-fallback 1000 (retry more pairs)
+│  ├─ Step 6: Image quality check
+│  │  ├─ python -m modular_pipeline.ingest.quality ./images
+│  │  ├─ High blur? → --blur-threshold 50 (permissive)
+│  │  ├─ Dark images? → Check lighting, rescan
+│  │  └─ Motion blur? → Too many frames extracted, increase --skip-frames
+│  └─ Still broken? → Data problem (motion, texture-less, incorrect geometry)
+│
+├─ 30-50% (WEAK)
+│  ├─ PRIMARY: Increase features
+│  │  └─ --max-keypoints 16000 --subpixel-refinement
+│  ├─ SECONDARY: Improve matching
+│  │  ├─ --fallback-threshold 75 (more fallback attempts)
+│  │  ├─ --num-neighbors 75 (NetVLAD, more candidates)
+│  │  └─ --min-matches 10 (permissive)
+│  ├─ TERTIARY: Relax SfM
+│  │  ├─ --mapper colmap (10x slower but more robust)
+│  │  ├─ --tri-max-error 8.0 (accept marginal points)
+│  │  └─ --tri-min-angle 0.5 (accept near-parallel rays)
+│  └─ LAST: Try different extraction
+│      └─ --extractor xfeat or superpoint
+│
+├─ 50-80% (MARGINAL)
+│  ├─ Step 1: Optimize features
+│  │  ├─ --max-keypoints 12000 (balance: 8k too few, 16k too slow)
+│  │  ├─ --nms-radius 4 (spread features across image)
+│  │  └─ --subpixel-refinement (if CPU time allows)
+│  ├─ Step 2: Improve matching pairs
+│  │  ├─ --retrieval hybrid (if video → sequential + NetVLAD)
+│  │  ├─ --num-neighbors 75
+│  │  └─ --filter-threshold 0.05 (stricter matches)
+│  ├─ Step 3: Better SfM initialization
+│  │  ├─ Try --mapper colmap (slower but better at weak cases)
+│  │  ├─ --camera-mode per_folder (if images from multiple cameras)
+│  │  └─ --run-bundle-adjustment True (final refinement)
+│  └─ Step 4: Relax triangulation
+│      ├─ --tri-max-error 6.0
+│      ├─ --tri-min-angle 1.0
+│      └─ --tri-max-dist 200.0 (if outdoor/large scene)
+│
+├─ 80-90% (GOOD)
+│  ├─ No action needed, acceptable
+│  ├─ Optional: --mapper colmap for final polish
+│  └─ Or: Keep GLOMAP, it's fast enough
+│
+└─ > 90% (EXCELLENT)
+   └─ Stop tuning registration. Focus on cloud density/quality.
+```
 
-Registration 50-80%?
-├─ --max-keypoints 16000
-├─ --fallback-threshold 75
-├─ --tri-max-error 8.0
-└─ Try --mapper colmap
+### 2. POINT CLOUD DENSITY
 
-Registration >90% but sparse cloud (<100K points)?
-├─ --max-keypoints 16000
-├─ --tri-max-error 2.0
-├─ --tri-min-angle 0.5
-├─ --min-matches 10
-└─ --subpixel-refinement
+```
+3D Point Count?
+├─ < 50K (SPARSE)
+│  ├─ PRIMARY: More features per image
+│  │  ├─ --max-keypoints 16000 (double from default)
+│  │  ├─ --nms-radius 1 (cluster features tighter)
+│  │  ├─ --remove-borders 0 (use edge pixels)
+│  │  └─ --keypoint-threshold 0.001 (aggressive detection)
+│  ├─ SECONDARY: More matches per pair
+│  │  ├─ --min-matches 10 (accept weaker pairs)
+│  │  ├─ --filter-threshold 0.05 (permissive)
+│  │  └─ --fallback-threshold 30 (retry sooner with MASt3R)
+│  ├─ TERTIARY: Relax triangulation
+│  │  ├─ --tri-max-error 8.0 (accept marginal points)
+│  │  ├─ --tri-min-angle 0.5 (accept near-parallel)
+│  │  └─ --run-point-triangulator True (if False, try True)
+│  └─ LAST: Try dense matcher
+│      └─ --fallback-matcher mast3r (dense 3D-aware)
+│
+├─ 50K-500K (NORMAL)
+│  └─ Good range for most scenes. Stop.
+│
+├─ 500K-5M (RICH)
+│  ├─ Acceptable for high-res captures
+│  ├─ If too slow in downstream (Splat, Mesh):
+│  │  ├─ --tri-max-error 2.0 (prune outliers)
+│  │  ├─ --tri-min-angle 2.0 (only confident points)
+│  │  └─ Optionally subsample point cloud
+│  └─ Else: Keep it, denser is generally better
+│
+└─ > 5M (EXTREMELY DENSE)
+   ├─ Check if you really need this many points
+   ├─ Memory/processing bottleneck downstream?
+   │  ├─ --tri-max-error 1.0 (strict pruning)
+   │  ├─ --tri-min-angle 3.0 (only high-confidence)
+   │  └─ --min-matches 25 (only strong pairs)
+   └─ If intentional (high-res, close-range): Keep it
+```
 
-Too slow (>4hrs for 6900 images)?
-├─ --max-keypoints 4000
-├─ --retrieval sequential (if video)
-├─ --num-neighbors 30
-├─ --max-pairs-fallback 0
+### 3. REPROJECTION ERROR & REGISTRATION QUALITY
 
-Reprojection error >2.0 px?
-├─ --camera-model OPENCV --refine-intrinsics
-├─ --subpixel-refinement
-├─ --tri-max-error 2.0
+```
+Mean Reprojection Error?
+├─ < 1.0 px (EXCELLENT)
+│  └─ Perfect. Stop.
+│
+├─ 1.0-2.0 px (GOOD)
+│  └─ Normal range. Acceptable.
+│
+├─ 2.0-3.0 px (MARGINAL)
+│  ├─ Camera model issue?
+│  │  ├─ If known distortion → --camera-model OPENCV
+│  │  ├─ Else → --refine-intrinsics True (optimize focal length, principal point)
+│  │  └─ Try: --subpixel-refinement
+│  ├─ Image quality issue?
+│  │  ├─ Blur: Check blur_threshold, rescan video
+│  │  ├─ Motion: If video, reduce --target-fps or increase --skip-frames
+│  │  └─ Focus: Check video for out-of-focus frames
+│  └─ Feature issue?
+│      ├─ --subpixel-refinement (refine to sub-pixel accuracy)
+│      └─ --remove-borders 2 (use more image area)
+│
+└─ > 3.0 px (POOR)
+   ├─ Step 1: Camera model
+   │  └─ --camera-model OPENCV --refine-intrinsics
+   ├─ Step 2: Sub-pixel refinement
+   │  └─ --subpixel-refinement
+   ├─ Step 3: Strict triangulation
+   │  ├─ --tri-max-error 1.0 (reject bad points)
+   │  └─ --tri-min-angle 2.5
+   ├─ Step 4: Tighter matching
+   │  ├─ --min-matches 25
+   │  └─ --filter-threshold 0.05
+   └─ Step 5: Check images for corruption
+      └─ python -m modular_pipeline.ingest.quality ./images
+```
 
-Noisy point cloud (artifacts)?
-├─ --tri-min-angle 3.0
-├─ --min-matches 20
-└─ --keypoint-threshold 0.01 (strict detection)
+### 4. POINT CLOUD QUALITY (Artifacts, Noise, Speckles)
+
+```
+Cloud has artifacts/noise?
+├─ Floating points far from scene?
+│  ├─ PRIMARY: Increase triangulation angle
+│  │  └─ --tri-min-angle 3.0 (only confident triangulations)
+│  ├─ SECONDARY: Increase reprojection error threshold
+│  │  └─ --tri-max-error 2.0 (reject outlier triangulations)
+│  ├─ TERTIARY: Stricter matching
+│  │  ├─ --min-matches 25
+│  │  └─ --filter-threshold 0.05 (low confidence threshold)
+│  └─ LAST: Disable fallback matcher
+│      └─ --max-pairs-fallback 0 (only LightGlue)
+│
+├─ Speckles in low-texture areas?
+│  ├─ These are false matches from weak features
+│  ├─ PRIMARY: Stricter detection
+│  │  ├─ --keypoint-threshold 0.01 (high confidence features)
+│  │  └─ --min-matches 25
+│  ├─ SECONDARY: Increase min angle
+│  │  └─ --tri-min-angle 2.0
+│  └─ LAST: Increase match confidence
+│      └─ --filter-threshold 0.05
+│
+├─ Ghosting (duplicate surfaces at slight offset)?
+│  ├─ Usually indicates lens distortion or mis-calibration
+│  ├─ PRIMARY: Strict camera model
+│  │  └─ --camera-model OPENCV --refine-intrinsics
+│  ├─ SECONDARY: Sub-pixel refinement
+│  │  └─ --subpixel-refinement
+│  └─ TERTIARY: Tighter triangulation
+│      ├─ --tri-max-error 1.0
+│      └─ --tri-min-angle 2.5
+│
+└─ If using masking: Mask boundaries bleeding artifacts?
+   ├─ PRIMARY: Increase mask confidence
+   │  └─ --confidence-threshold 0.85
+   ├─ SECONDARY: Enable temporal consistency
+   │  └─ --use-temporal-consistency True --temporal-window 7
+   └─ TERTIARY: Expand safe regions
+       └─ --max-mask-area-ratio 0.3 (don't remove >30% of image)
+```
+
+### 5. PROCESSING TIME & PERFORMANCE
+
+```
+Too slow? (>4 hours for 6900 images)
+├─ Where is the bottleneck?
+│  ├─ Extract stage slow?
+│  │  ├─ PRIMARY: Reduce features
+│  │  │  └─ --max-keypoints 4000 (50% speedup)
+│  │  ├─ SECONDARY: Use faster extractor
+│  │  │  └─ --extractor xfeat (3x faster than ALIKED)
+│  │  └─ TERTIARY: Skip sub-pixel
+│  │      └─ --subpixel-refinement False
+│  │
+│  ├─ Match stage slow?
+│  │  ├─ PRIMARY: Reduce pair candidates
+│  │  │  ├─ --num-neighbors 30 (down from 50)
+│  │  │  ├─ --max-pairs-fallback 0 (skip MASt3R)
+│  │  │  └─ --retrieval sequential (if video, much faster)
+│  │  ├─ SECONDARY: Fewer keypoints
+│  │  │  └─ --max-keypoints 4000
+│  │  └─ TERTIARY: Use faster matcher
+│  │      └─ --matcher superglue (faster than lightglue, lower quality)
+│  │
+│  ├─ SfM stage slow?
+│  │  ├─ PRIMARY: GLOMAP is default (already fast)
+│  │  ├─ SECONDARY: Reduce keypoints before SfM
+│  │  │  └─ --max-keypoints 4000
+│  │  └─ TERTIARY: Reduce refinement
+│  │      └─ --refine-intrinsics False (skip intrinsic optimization)
+│  │
+│  ├─ Retrieve stage slow? (rare, usually <1 minute)
+│  │  ├─ PRIMARY: Reduce neighbors
+│  │  │  └─ --num-neighbors 30
+│  │  ├─ SECONDARY: Skip duplicates filtering
+│  │  │  └─ --filter-duplicates False
+│  │  └─ TERTIARY: Lower VLAD dimensionality
+│  │      └─ --vlad-dim 2048 (from 4096)
+│  │
+│  └─ Overall too slow?
+│      ├─ Reduce --target-fps (extract fewer frames)
+│      ├─ Reduce --max-keypoints to 4000
+│      ├─ Use --retrieval sequential (if video)
+│      ├─ Set --max-pairs-fallback 0
+│      └─ Use --extractor xfeat (3x faster)
+│
+├─ Memory issues?
+│  ├─ OOM during Extract?
+│  │  └─ --resize-max 1200 (downscale images)
+│  ├─ OOM during Match?
+│  │  ├─ --max-keypoints 4000 (smaller feature sets)
+│  │  └─ Reduce dataset size (--max-frames, --skip-frames)
+│  └─ OOM during SfM?
+│      ├─ --max-num-tracks 3_000_000 (limit 3D points)
+│      └─ Process in chunks (run separately on image subsets)
+│
+└─ GPU not being used?
+   ├─ Check: CUDA available? nvidia-smi
+   ├─ Extract: Should auto-use GPU (ALIKED, XFeat)
+   ├─ Match: Uses GPU for LightGlue
+   ├─ Reframe: --projection-backend torch_gpu (explicitly use GPU)
+   └─ If still slow: CPU bottleneck elsewhere (I/O, retrieval)
+```
+
+### 6. DATA-SPECIFIC SCENARIOS
+
+```
+What type of data do you have?
+
+├─ VIDEO (Continuous Frames)
+│  ├─ Use: --retrieval sequential (temporal neighbors, fast)
+│  ├─ Set: --num-neighbors 20-30 (frame window)
+│  ├─ Skip: --skip-frames 1-2 (extract every Nth frame)
+│  └─ Watch: Motion blur (blur_threshold might filter too much)
+│
+├─ DRONE SURVEY (Systematic Coverage)
+│  ├─ Expect: Good registration (drone stable, wide baselines)
+│  ├─ Use: --retrieval netvlad (unordered, but correlated)
+│  ├─ Set: --num-neighbors 50
+│  ├─ Camera: --camera-model OPENCV (if DJI)
+│  └─ Pattern: Regular grid = good feature distribution
+│
+├─ HANDHELD / WALK-AROUND
+│  ├─ Expect: Variable baselines, frame blur, motion
+│  ├─ Use: --retrieval hybrid (sequential + NetVLAD)
+│  ├─ Set: --target-fps 2 (subsample to reduce blur)
+│  ├─ Use: --masking (remove hand/body shadows)
+│  └─ Features: May need --max-keypoints 16000 (fewer reliable features)
+│
+├─ 360° FOOTAGE
+│  ├─ MUST: --rig-pattern ring12 (or geodesic_20)
+│  ├─ MUST: --projection-backend torch_gpu (fast reframing)
+│  ├─ Use: --masking (remove tripod/selfie stick)
+│  ├─ Enable: --geometry-aware True (pole handling)
+│  └─ Set: --fov-h 90 --fov-v 60
+│
+├─ CLOSE-RANGE / ARCHITECTURAL
+│  ├─ Enable: --subpixel-refinement (precision matters)
+│  ├─ Use: --max-keypoints 16000 (high detail)
+│  ├─ Triangulation: --tri-max-error 1.0 (strict)
+│  ├─ Camera: --camera-model OPENCV (phones/small sensors have distortion)
+│  └─ Watch: Out-of-focus regions (use masking)
+│
+├─ OUTDOOR / LANDSCAPE
+│  ├─ Large scale: --tri-max-dist 500.0 (no distance limit)
+│  ├─ Expect: Lighting variation (may affect matching)
+│  ├─ Use: --max-keypoints 8000 (sufficient for texture)
+│  ├─ If sparse texture: --max-keypoints 12000
+│  └─ Watch: Sky/water (no features, don't match)
+│
+├─ INDOOR / CONFINED SPACE
+│  ├─ Small baseline: --tri-min-angle 0.5 (accept small angles)
+│  ├─ Watch: Repetitive texture (false matches)
+│  │  └─ Use: --min-matches 25 (strict matching)
+│  ├─ Lighting: Variable (may need --min-quality-score 0.3)
+│  ├─ Masking: Use --masking to remove dynamic objects
+│  └─ Dense: --max-keypoints 12000-16000
+│
+├─ NIGHT / LOW-LIGHT
+│  ├─ Challenging! Expect: Poor registration
+│  ├─ Increase: --keypoint-threshold 0.001 (aggressive detection)
+│  ├─ Increase: --max-keypoints 16000
+│  ├─ Relax: --min-matches 10
+│  ├─ Ingest: --min-quality-score 0.2 (keep marginal frames)
+│  └─ Consider: Adding more light source or higher ISO video
+│
+└─ TEXTURE-LESS (Walls, Plain Surfaces)
+   ├─ HARD! Expect: Poor matching
+   ├─ Increase: --keypoint-threshold 0.001
+   ├─ Increase: --max-keypoints 16000
+   ├─ Relax: --min-matches 10
+   ├─ Retrieval: --num-neighbors 100 (more candidates)
+   └─ Consider: Adding contrast (lighting) or change capture angle
+```
+
+### 7. SPECIFIC SYMPTOMS
+
+```
+MATCHING FAILURES
+├─ Few pairs match (< 20% success)?
+│  ├─ Increase candidates: --num-neighbors 100
+│  ├─ Relax threshold: --filter-threshold 0.1
+│  ├─ Lower bar: --min-matches 10
+│  └─ Fallback sooner: --fallback-threshold 20
+│
+├─ All pairs match but few points?
+│  ├─ Too strict on triangulation
+│  │  ├─ --tri-max-error 8.0
+│  │  └─ --tri-min-angle 0.5
+│  └─ Or too few matches per pair
+│      └─ --min-matches 5
+│
+└─ Random/inconsistent matches?
+   ├─ Weak features: --keypoint-threshold 0.01
+   ├─ Weak matches: --filter-threshold 0.05
+   └─ Dataset issue: Check for duplicates, very similar frames
+
+FEATURE EXTRACTION ISSUES
+├─ Uneven feature distribution (clustered in one region)?
+│  ├─ Increase NMS: --nms-radius 5
+│  ├─ Use more borders: --remove-borders 0
+│  └─ Different extractor: --extractor disk (position-diverse)
+│
+├─ Too few features (< 1000 per image)?
+│  ├─ Lower threshold: --keypoint-threshold 0.001
+│  ├─ Extract more: --max-keypoints 16000
+│  └─ Different extractor: --extractor xfeat
+│
+└─ Too many duplicates (similar features)?
+   ├─ Increase NMS: --nms-radius 5
+   └─ Stricter threshold: --keypoint-threshold 0.01
+
+RECONSTRUCTION ISSUES
+├─ Drifting/distorted model?
+│  ├─ Camera model: --camera-model OPENCV --refine-intrinsics
+│  ├─ SfM backend: Try --mapper colmap
+│  └─ Bundle adjustment: --run-bundle-adjustment True
+│
+├─ Model offset/translated?
+│  ├─ Usually OK (arbitrary coordinate frame)
+│  ├─ Unless you need georeferencing (use camera poses)
+│  └─ Check registration rate > 90%
+│
+└─ Holes/gaps in model?
+   ├─ Matching: Increase --num-neighbors, --fallback-threshold
+   ├─ Features: Increase --max-keypoints
+   └─ Baselines: Is capture coverage continuous?
+```
+
+### 8. ITERATIVE TUNING ORDER
+
+**When starting with defaults and nothing works:**
+
+```
+Step 1: Diagnose
+├─ Check registration rate
+├─ Check reprojection error
+├─ Check point count
+└─ Check image quality (python -m modular_pipeline.ingest.quality)
+
+Step 2: If registration < 50%
+├─ Increase features: --max-keypoints 16000
+├─ Try different SfM: --mapper colmap
+└─ Check camera model: --camera-model OPENCV
+
+Step 3: If registration 50-90%
+├─ Optimize features: --max-keypoints 12000
+├─ Improve matching: --fallback-threshold 75 --num-neighbors 75
+└─ Relax triangulation: --tri-max-error 6.0 --tri-min-angle 1.0
+
+Step 4: If registration > 90% but sparse
+├─ Increase features: --max-keypoints 16000
+├─ Lower match bar: --min-matches 10
+└─ Relax triangulation: --tri-max-error 8.0 --tri-min-angle 0.5
+
+Step 5: If registration > 90% but noisy
+├─ Increase match confidence: --min-matches 25 --filter-threshold 0.05
+├─ Strict triangulation: --tri-min-angle 2.5 --tri-max-error 2.0
+└─ Strict detection: --keypoint-threshold 0.01
+
+Step 6: If too slow
+├─ Reduce features: --max-keypoints 4000
+├─ Reduce pairs: --num-neighbors 30 --max-pairs-fallback 0
+├─ Faster extractor: --extractor xfeat
+└─ Faster retrieval: --retrieval sequential (if video)
 ```
 
 ---
